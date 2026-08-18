@@ -35,7 +35,7 @@ func run() error {
 		return err
 	}
 
-	log := logging.New(cfg.LogLevel, os.Stdout, slog.String("service", "voiceline"))
+	log := logging.New(cfg.LogLevel, os.Stdout).With("service", "voiceline")
 	slog.SetDefault(log)
 
 	llmClient := llm.NewClient(llm.Options{

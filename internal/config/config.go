@@ -31,7 +31,6 @@ type Config struct {
 
 	Sink               string
 	WebhookURL         string
-	NotionBaseURL      string
 	NotionToken        string
 	NotionParentPageID string
 }
@@ -65,7 +64,6 @@ func Load() (Config, error) {
 
 		Sink:               strings.ToLower(env("SINK", SinkWebhook)),
 		WebhookURL:         os.Getenv("WEBHOOK_URL"),
-		NotionBaseURL:      env("NOTION_BASE_URL", "https://api.notion.com/v1"),
 		NotionToken:        os.Getenv("NOTION_TOKEN"),
 		NotionParentPageID: os.Getenv("NOTION_PARENT_PAGE_ID"),
 	}

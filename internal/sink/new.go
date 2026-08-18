@@ -16,12 +16,7 @@ const sinkTimeout = 30 * time.Second
 func New(cfg config.Config) voiceline.Sink {
 	client := &http.Client{Timeout: sinkTimeout}
 	if cfg.Sink == config.SinkNotion {
-		return NewNotion(NotionOptions{
-			BaseURL:      cfg.NotionBaseURL,
-			Token:        cfg.NotionToken,
-			ParentPageID: cfg.NotionParentPageID,
-			HTTPClient:   client,
-		})
+		return NewNotion("", cfg.NotionToken, cfg.NotionParentPageID, client)
 	}
 	return NewWebhook(cfg.WebhookURL, client)
 }

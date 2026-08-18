@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"testing"
 
 	"github.com/ash-singh/voiceline-challenge/internal/logging"
@@ -12,7 +11,7 @@ import (
 
 func TestNewEmitsJSONWithRequestIDFromContext(t *testing.T) {
 	var buf bytes.Buffer
-	log := logging.New("debug", &buf, slog.String("service", "voiceline"))
+	log := logging.New("debug", &buf).With("service", "voiceline")
 	ctx := logging.WithRequestID(context.Background(), "req-42")
 
 	log.InfoContext(ctx, "stored", "sink", "webhook")

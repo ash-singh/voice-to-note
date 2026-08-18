@@ -98,9 +98,7 @@ func TestNotionSaveCreatesPageUnderParent(t *testing.T) {
 		io.WriteString(w, `{"id":"page-1","url":"https://notion.so/page-1"}`)
 	}))
 	defer srv.Close()
-	s := sink.NewNotion(sink.NotionOptions{
-		BaseURL: srv.URL + "/v1", Token: "secret", ParentPageID: "parent-1", HTTPClient: srv.Client(),
-	})
+	s := sink.NewNotion(srv.URL+"/v1", "secret", "parent-1", srv.Client())
 
 	// Act
 	ref, err := s.Save(context.Background(), testNote)
@@ -135,7 +133,7 @@ func TestNotionSaveChunksLongTranscript(t *testing.T) {
 		io.WriteString(w, `{"id":"page-1","url":"https://notion.so/page-1"}`)
 	}))
 	defer srv.Close()
-	s := sink.NewNotion(sink.NotionOptions{BaseURL: srv.URL, Token: "t", ParentPageID: "p", HTTPClient: srv.Client()})
+	s := sink.NewNotion(srv.URL, "t", "p", srv.Client())
 
 	long := voiceline.Note{Title: "Long", Summary: "s", Transcript: strings.Repeat("ä", 3000)}
 	if _, err := s.Save(context.Background(), long); err != nil {
@@ -163,8 +161,7 @@ func TestNotionSaveReportsUpstreamStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := sink.NewNotion(sink.NotionOptions{BaseURL: srv.URL, Token: "bad", HTTPClient: srv.Client()}).
-		Save(context.Background(), testNote)
+	_, err := sink.NewNotion(srv.URL, "bad", "p", srv.Client()).Save(context.Background(), testNote)
 	if err == nil || !strings.Contains(err.Error(), "status 401") {
 		t.Fatalf("Save() error = %v, want status 401", err)
 	}

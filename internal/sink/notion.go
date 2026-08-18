@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -13,6 +12,7 @@ import (
 )
 
 const (
+	notionBaseURL = "https://api.notion.com/v1"
 	notionVersion = "2022-06-28"
 	// notionTextLimit is Notion's per-rich-text-object character limit.
 	notionTextLimit = 2000
@@ -27,22 +27,17 @@ type Notion struct {
 	parentPageID string
 }
 
-type NotionOptions struct {
-	BaseURL      string
-	Token        string
-	ParentPageID string
-	HTTPClient   *http.Client
-}
-
-func NewNotion(o NotionOptions) *Notion {
-	if o.HTTPClient == nil {
-		o.HTTPClient = http.DefaultClient
+// NewNotion returns a sink creating pages under parentPageID. baseURL is
+// overridden only by tests; pass "" for the Notion API.
+func NewNotion(baseURL, token, parentPageID string, httpClient *http.Client) *Notion {
+	if baseURL == "" {
+		baseURL = notionBaseURL
 	}
 	return &Notion{
-		httpClient:   o.HTTPClient,
-		baseURL:      strings.TrimRight(o.BaseURL, "/"),
-		token:        o.Token,
-		parentPageID: o.ParentPageID,
+		httpClient:   httpClient,
+		baseURL:      strings.TrimRight(baseURL, "/"),
+		token:        token,
+		parentPageID: parentPageID,
 	}
 }
 
@@ -75,22 +70,17 @@ func (n *Notion) Save(ctx context.Context, note voiceline.Note) (string, error) 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
-		return "", fmt.Errorf("notion returned status %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+	if err := checkStatus(resp, "notion"); err != nil {
+		return "", err
 	}
 
 	var out struct {
-		ID  string `json:"id"`
 		URL string `json:"url"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("decode notion response: %w", err)
 	}
-	if out.URL != "" {
-		return out.URL, nil
-	}
-	return out.ID, nil
+	return out.URL, nil
 }
 
 func notionChildren(note voiceline.Note) []map[string]any {

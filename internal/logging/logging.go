@@ -13,13 +13,13 @@ import (
 
 // New returns a JSON logger at the given level ("debug", "info", "warn",
 // "error"). Unknown levels fall back to info.
-func New(level string, w io.Writer, attrs ...slog.Attr) *slog.Logger {
+func New(level string, w io.Writer) *slog.Logger {
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(level)); err != nil {
 		lvl = slog.LevelInfo
 	}
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: lvl})
-	return slog.New(&contextHandler{Handler: h.WithAttrs(attrs)})
+	return slog.New(&contextHandler{Handler: h})
 }
 
 type requestIDKey struct{}
@@ -48,8 +48,4 @@ func (h *contextHandler) Handle(ctx context.Context, r slog.Record) error {
 
 func (h *contextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &contextHandler{Handler: h.Handler.WithAttrs(attrs)}
-}
-
-func (h *contextHandler) WithGroup(name string) slog.Handler {
-	return &contextHandler{Handler: h.Handler.WithGroup(name)}
 }
