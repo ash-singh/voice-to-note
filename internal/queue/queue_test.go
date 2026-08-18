@@ -3,6 +3,7 @@ package queue_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ash-singh/voice-to-note/internal/memo"
 	"github.com/ash-singh/voice-to-note/internal/queue"
@@ -46,7 +48,7 @@ func (f *fakeProcessor) callCount() int {
 
 func newTestQueue(t *testing.T, proc queue.Processor) *queue.Queue {
 	t.Helper()
-	q, err := queue.New(t.TempDir(), proc, slog.New(slog.DiscardHandler))
+	q, err := queue.New(t.TempDir(), proc, time.Minute, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -126,7 +128,7 @@ func TestProcessNextRecordsTheResult(t *testing.T) {
 	}
 	proc := &fakeProcessor{result: want}
 	dir := t.TempDir()
-	q, err := queue.New(dir, proc, slog.New(slog.DiscardHandler))
+	q, err := queue.New(dir, proc, time.Minute, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -296,5 +298,190 @@ func TestEnqueueIsIdempotentWhileAJobIsInFlight(t *testing.T) {
 	}
 	if got := proc.callCount(); got != 1 {
 		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// signalProcessor reports each processed job, so tests can wait on progress
+// instead of sleeping.
+type signalProcessor struct {
+	fakeProcessor
+	calls chan string
+}
+
+func (s *signalProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	result, err := s.fakeProcessor.Process(ctx, filename, audio)
+	s.calls <- filename
+	return result, err
+}
+
+// Run is what makes the queue drain on its own: workers keep claiming jobs
+// until the server shuts down, at which point Run must return.
+func TestRunDrainsTheQueueAndStopsOnContextCancel(t *testing.T) {
+	proc := &signalProcessor{calls: make(chan string, 3)}
+	q := newTestQueue(t, proc)
+	for _, audio := range []string{"one", "two", "three"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 2)
+		close(stopped)
+	}()
+
+	for i := range 3 {
+		select {
+		case <-proc.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of 3 jobs processed before timing out", i)
+		}
+	}
+
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+}
+
+// cancellingProcessor cancels the run context from inside the first job, the way
+// a SIGTERM arrives mid-flight.
+type cancellingProcessor struct {
+	fakeProcessor
+	cancel func()
+}
+
+func (c *cancellingProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	result, err := c.fakeProcessor.Process(ctx, filename, audio)
+	c.cancel()
+	return result, err
+}
+
+// On shutdown a worker must finish the job in hand and then stop, rather than
+// draining the whole backlog past its deadline.
+func TestRunStopsClaimingNewWorkOnceCancelled(t *testing.T) {
+	proc := &cancellingProcessor{}
+	q := newTestQueue(t, proc)
+	for _, audio := range []string{"one", "two"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	proc.cancel = cancel
+
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 1)
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("jobs processed after cancel = %d, want 1", got)
+	}
+}
+
+// Async processing only works if the caller can find out what happened, so
+// Lookup is the replacement for the note the 201 body used to carry.
+func TestLookupReportsJobState(t *testing.T) {
+	t.Run("queued", func(t *testing.T) {
+		q := newTestQueue(t, &fakeProcessor{})
+		id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		got, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if got.ID != id || got.State != queue.StateQueued {
+			t.Errorf("status = %+v, want id %s in state %s", got, id, queue.StateQueued)
+		}
+		if got.Result != nil {
+			t.Errorf("queued job carries a result: %+v", got.Result)
+		}
+	})
+
+	t.Run("done carries the result", func(t *testing.T) {
+		want := memo.Result{Note: memo.Note{Title: "Invoice"}, Sink: "notion", SinkRef: "https://notion.so/page"}
+		q := newTestQueue(t, &fakeProcessor{result: want})
+		id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if _, err := q.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext: %v", err)
+		}
+
+		got, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if got.State != queue.StateDone {
+			t.Errorf("state = %s, want %s", got.State, queue.StateDone)
+		}
+		if got.Result == nil || !reflect.DeepEqual(*got.Result, want) {
+			t.Errorf("result = %+v, want %+v", got.Result, want)
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		q := newTestQueue(t, &fakeProcessor{})
+
+		_, err := q.Lookup("0123456789abcdef")
+
+		if !errors.Is(err, queue.ErrJobNotFound) {
+			t.Errorf("error = %v, want ErrJobNotFound", err)
+		}
+	})
+}
+
+// deadlineProcessor reports the deadline it was given.
+type deadlineProcessor struct {
+	fakeProcessor
+	hasDeadline bool
+	within      time.Duration
+}
+
+func (d *deadlineProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	deadline, ok := ctx.Deadline()
+	d.hasDeadline = ok
+	if ok {
+		d.within = time.Until(deadline)
+	}
+	return d.fakeProcessor.Process(ctx, filename, audio)
+}
+
+// PROCESS_TIMEOUT bounds the whole pipeline. Once the work moves off the request
+// there is no request context to carry it, so the queue has to apply it.
+func TestProcessNextBoundsAJobByTheProcessTimeout(t *testing.T) {
+	proc := &deadlineProcessor{}
+	q, err := queue.New(t.TempDir(), proc, 90*time.Second, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	if _, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	if !proc.hasDeadline {
+		t.Fatal("the job context has no deadline, so a stuck pipeline holds a worker forever")
+	}
+	if proc.within <= 0 || proc.within > 90*time.Second {
+		t.Errorf("deadline is %v away, want it within the 90s timeout", proc.within)
 	}
 }

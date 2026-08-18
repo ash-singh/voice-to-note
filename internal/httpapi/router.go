@@ -23,6 +23,7 @@ func NewRouter(h *NoteHandler, log *slog.Logger) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.POST("/v1/notes", h.Create)
+	r.GET("/v1/notes/:id", h.Show)
 
 	return r
 }

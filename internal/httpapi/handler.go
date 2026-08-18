@@ -2,18 +2,16 @@
 package httpapi
 
 import (
-	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ash-singh/voice-to-note/internal/memo"
+	"github.com/ash-singh/voice-to-note/internal/queue"
 )
 
 const audioField = "audio"
@@ -24,25 +22,27 @@ var allowedAudioExt = map[string]bool{
 	".mpga": true, ".oga": true, ".ogg": true, ".wav": true, ".webm": true,
 }
 
-// Processor is the domain entry point the handler depends on.
-type Processor interface {
-	Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error)
+// Jobs is the background queue the handler hands uploads to and reads job state
+// back from.
+type Jobs interface {
+	Enqueue(filename string, audio io.Reader) (string, error)
+	Lookup(id string) (queue.Status, error)
 }
 
 // NoteHandler serves POST /v1/notes.
 type NoteHandler struct {
-	svc           Processor
+	queue         Jobs
 	maxAudioBytes int64
-	timeout       time.Duration
 	log           *slog.Logger
 }
 
-func NewNoteHandler(svc Processor, maxAudioBytes int64, timeout time.Duration, log *slog.Logger) *NoteHandler {
-	return &NoteHandler{svc: svc, maxAudioBytes: maxAudioBytes, timeout: timeout, log: log}
+func NewNoteHandler(queue Jobs, maxAudioBytes int64, log *slog.Logger) *NoteHandler {
+	return &NoteHandler{queue: queue, maxAudioBytes: maxAudioBytes, log: log}
 }
 
-// Create accepts a multipart upload with an "audio" file part, has it
-// transcribed and summarised, and stores the note in the configured sink.
+// Create accepts a multipart upload with an "audio" file part and queues it for
+// transcription, summarising and delivery. The work happens in the background,
+// so the response carries a job id rather than the note.
 func (h *NoteHandler) Create(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxAudioBytes)
 
@@ -75,19 +75,28 @@ func (h *NoteHandler) Create(c *gin.Context) {
 	}
 	defer file.Close()
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), h.timeout)
-	defer cancel()
-
-	result, err := h.svc.Process(ctx, filename, file)
-	switch {
-	case errors.Is(err, memo.ErrEmptyTranscript):
-		respondError(c, http.StatusUnprocessableEntity, "no speech detected in the audio")
-		return
-	case err != nil:
+	id, err := h.queue.Enqueue(filename, file)
+	if err != nil {
 		_ = c.Error(err)
-		respondError(c, http.StatusBadGateway, "could not process the voice memo")
+		respondError(c, http.StatusInternalServerError, "could not accept the voice memo")
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"data": result})
+	c.Header("Location", "/v1/notes/"+id)
+	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"job_id": id, "state": "queued"}})
+}
+
+// Show reports what has become of a queued voice memo.
+func (h *NoteHandler) Show(c *gin.Context) {
+	status, err := h.queue.Lookup(c.Param("id"))
+	if err != nil {
+		if errors.Is(err, queue.ErrJobNotFound) {
+			respondError(c, http.StatusNotFound, "no such job")
+			return
+		}
+		_ = c.Error(err)
+		respondError(c, http.StatusInternalServerError, "could not look up the job")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": status})
 }

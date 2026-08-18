@@ -8,12 +8,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ash-singh/voice-to-note/internal/memo"
 )
@@ -31,6 +34,29 @@ const (
 // distinct recordings apart, and a short id stays readable in logs and URLs.
 const idBytes = 8
 
+// State is where a job has got to.
+type State string
+
+// Job states. Processing and queued are distinguished because a stuck job shows
+// up as processing, which is what you want to see when diagnosing one.
+const (
+	StateQueued     State = "queued"
+	StateProcessing State = "processing"
+	StateDone       State = "done"
+)
+
+// ErrJobNotFound means no job with that id was ever enqueued, or its record has
+// since been swept.
+var ErrJobNotFound = errors.New("job not found")
+
+// Status is what a caller can learn about a job after the request that created
+// it has returned. Result is set once the job is done.
+type Status struct {
+	ID     string       `json:"id"`
+	State  State        `json:"state"`
+	Result *memo.Result `json:"result,omitempty"`
+}
+
 // Processor is the domain entry point a worker drives.
 type Processor interface {
 	Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error)
@@ -38,19 +64,21 @@ type Processor interface {
 
 // Queue is a directory of spooled jobs.
 type Queue struct {
-	dir  string
-	proc Processor
-	log  *slog.Logger
+	dir     string
+	proc    Processor
+	timeout time.Duration
+	log     *slog.Logger
 }
 
-// New prepares dir as a queue root.
-func New(dir string, proc Processor, log *slog.Logger) (*Queue, error) {
+// New prepares dir as a queue root. timeout bounds one job: the request that
+// enqueued it is long gone, so its context cannot carry the deadline.
+func New(dir string, proc Processor, timeout time.Duration, log *slog.Logger) (*Queue, error) {
 	for _, sub := range []string{dirTmp, dirPending, dirActive, dirDone} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
 			return nil, fmt.Errorf("prepare queue dir: %w", err)
 		}
 	}
-	return &Queue{dir: dir, proc: proc, log: log}, nil
+	return &Queue{dir: dir, proc: proc, timeout: timeout, log: log}, nil
 }
 
 // Enqueue spools audio and returns the job id. The id is a hash of the audio, so
@@ -102,6 +130,45 @@ func (q *Queue) known(id string) (bool, error) {
 	return false, nil
 }
 
+// idlePoll is how long a worker waits before looking for work again. A voice
+// memo is not latency sensitive, so polling beats a filesystem watcher.
+const idlePoll = time.Second
+
+// Run drives workers until ctx is cancelled, then returns once they have all
+// finished the job in hand.
+func (q *Queue) Run(ctx context.Context, workers int) {
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.work(ctx)
+		}()
+	}
+	wg.Wait()
+}
+
+// work claims jobs back to back while there are any, and idles otherwise.
+func (q *Queue) work(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		claimed, err := q.ProcessNext(ctx)
+		if err != nil {
+			q.log.ErrorContext(ctx, "job failed", "error", err)
+		}
+		if claimed {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(idlePoll):
+		}
+	}
+}
+
 // ProcessNext claims and runs one job. It reports whether a job was claimed.
 func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 	entries, err := os.ReadDir(q.path(dirPending))
@@ -131,6 +198,9 @@ func (q *Queue) run(ctx context.Context, name string) error {
 		return fmt.Errorf("open claimed job: %w", err)
 	}
 	defer file.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, q.timeout)
+	defer cancel()
 
 	result, err := q.proc.Process(ctx, name, file)
 	if err != nil {
@@ -168,4 +238,30 @@ func idOf(name string) string {
 
 func (q *Queue) path(elem ...string) string {
 	return filepath.Join(append([]string{q.dir}, elem...)...)
+}
+
+// Lookup reports the state of a job, and its result once it has one.
+func (q *Queue) Lookup(id string) (Status, error) {
+	body, err := os.ReadFile(q.path(dirDone, id+".json"))
+	switch {
+	case err == nil:
+		var result memo.Result
+		if err := json.Unmarshal(body, &result); err != nil {
+			return Status{}, fmt.Errorf("decode result of job %s: %w", id, err)
+		}
+		return Status{ID: id, State: StateDone, Result: &result}, nil
+	case !os.IsNotExist(err):
+		return Status{}, fmt.Errorf("look up job %s: %w", id, err)
+	}
+
+	for state, sub := range map[State]string{StateQueued: dirPending, StateProcessing: dirActive} {
+		matches, err := filepath.Glob(q.path(sub, id+".*"))
+		if err != nil {
+			return Status{}, fmt.Errorf("look up job %s: %w", id, err)
+		}
+		if len(matches) > 0 {
+			return Status{ID: id, State: state}, nil
+		}
+	}
+	return Status{}, fmt.Errorf("%s: %w", id, ErrJobNotFound)
 }

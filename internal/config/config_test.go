@@ -15,6 +15,7 @@ var configEnv = []string{
 	"ADDR", "LOG_LEVEL", "MAX_AUDIO_BYTES", "PROCESS_TIMEOUT", "SHUTDOWN_TIMEOUT",
 	"LLM_BASE_URL", "LLM_API_KEY", "TRANSCRIBE_MODEL", "CHAT_MODEL",
 	"SINK", "WEBHOOK_URL", "NOTION_TOKEN", "NOTION_PARENT_PAGE_ID",
+	"QUEUE_DIR", "QUEUE_WORKERS",
 }
 
 func clearEnv(t *testing.T) {
@@ -121,4 +122,51 @@ func TestLoadValidationErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadQueueSettings(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("LLM_API_KEY", "key")
+		t.Setenv("WEBHOOK_URL", "https://sink.example/hook")
+
+		cfg, err := config.Load()
+
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.QueueDir != "queue" || cfg.QueueWorkers != 2 {
+			t.Errorf("queue defaults = (%q, %d), want (%q, %d)", cfg.QueueDir, cfg.QueueWorkers, "queue", 2)
+		}
+	})
+
+	t.Run("from env", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("LLM_API_KEY", "key")
+		t.Setenv("WEBHOOK_URL", "https://sink.example/hook")
+		t.Setenv("QUEUE_DIR", "/var/spool/memos")
+		t.Setenv("QUEUE_WORKERS", "5")
+
+		cfg, err := config.Load()
+
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.QueueDir != "/var/spool/memos" || cfg.QueueWorkers != 5 {
+			t.Errorf("queue settings = (%q, %d)", cfg.QueueDir, cfg.QueueWorkers)
+		}
+	})
+
+	t.Run("worker count must be positive", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("LLM_API_KEY", "key")
+		t.Setenv("WEBHOOK_URL", "https://sink.example/hook")
+		t.Setenv("QUEUE_WORKERS", "0")
+
+		_, err := config.Load()
+
+		if err == nil || !strings.Contains(err.Error(), "QUEUE_WORKERS") {
+			t.Errorf("error = %v, want it to name QUEUE_WORKERS", err)
+		}
+	})
 }

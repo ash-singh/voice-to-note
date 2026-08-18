@@ -29,6 +29,9 @@ type Config struct {
 	TranscribeModel string
 	ChatModel       string
 
+	QueueDir     string
+	QueueWorkers int
+
 	Sink               string
 	WebhookURL         string
 	NotionToken        string
@@ -49,6 +52,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err)
 	}
+	queueWorkers, err := strconv.Atoi(env("QUEUE_WORKERS", "2"))
+	if err != nil {
+		return Config{}, fmt.Errorf("QUEUE_WORKERS: %w", err)
+	}
 
 	cfg := Config{
 		Addr:            env("ADDR", ":8080"),
@@ -61,6 +68,9 @@ func Load() (Config, error) {
 		LLMAPIKey:       os.Getenv("LLM_API_KEY"),
 		TranscribeModel: env("TRANSCRIBE_MODEL", "whisper-1"),
 		ChatModel:       env("CHAT_MODEL", "gpt-4o-mini"),
+
+		QueueDir:     env("QUEUE_DIR", "queue"),
+		QueueWorkers: queueWorkers,
 
 		Sink:               strings.ToLower(env("SINK", SinkWebhook)),
 		WebhookURL:         os.Getenv("WEBHOOK_URL"),
@@ -78,6 +88,9 @@ func (c Config) validate() error {
 	}
 	if c.MaxAudioBytes <= 0 {
 		errs = append(errs, errors.New("MAX_AUDIO_BYTES must be positive"))
+	}
+	if c.QueueWorkers <= 0 {
+		errs = append(errs, errors.New("QUEUE_WORKERS must be positive"))
 	}
 	switch c.Sink {
 	case SinkWebhook:

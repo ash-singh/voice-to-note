@@ -19,6 +19,7 @@ import (
 	"github.com/ash-singh/voice-to-note/internal/llm"
 	"github.com/ash-singh/voice-to-note/internal/logging"
 	"github.com/ash-singh/voice-to-note/internal/memo"
+	"github.com/ash-singh/voice-to-note/internal/queue"
 	"github.com/ash-singh/voice-to-note/internal/sink"
 )
 
@@ -47,7 +48,11 @@ func run() error {
 	})
 	noteSink := sink.New(cfg)
 	service := memo.NewService(llmClient, llmClient, noteSink, log)
-	handler := httpapi.NewNoteHandler(service, cfg.MaxAudioBytes, cfg.ProcessTimeout, log)
+	jobs, err := queue.New(cfg.QueueDir, service, cfg.ProcessTimeout, log)
+	if err != nil {
+		return err
+	}
+	handler := httpapi.NewNoteHandler(jobs, cfg.MaxAudioBytes, log)
 
 	gin.SetMode(gin.ReleaseMode)
 	srv := &http.Server{
@@ -59,9 +64,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		jobs.Run(ctx, cfg.QueueWorkers)
+	}()
+
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Info("server listening", "addr", cfg.Addr, "sink", noteSink.Name(), "chat_model", cfg.ChatModel)
+		log.Info("server listening", "addr", cfg.Addr, "sink", noteSink.Name(),
+			"chat_model", cfg.ChatModel, "queue_dir", cfg.QueueDir, "queue_workers", cfg.QueueWorkers)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -80,6 +92,7 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return err
 	}
+	<-workersDone // the queue is durable, so anything unfinished is picked up on restart
 
 	log.Info("server stopped")
 	return nil
