@@ -17,7 +17,7 @@ POST /v1/voicelines (multipart audio)
 
 ## Quick start
 
-Needs Go 1.26+ (see the `go` directive in `go.mod`). No database, no other services.
+Needs Go 1.26+ (`go` directive in `go.mod`). No database, no other services.
 
 ```bash
 cp .env.example .env          # then edit it, see the table below
@@ -96,13 +96,9 @@ status, duration, size, client ip, request id) plus domain events. Nothing else
 writes to stdout: the server uses `gin.New()` rather than `gin.Default()`, and
 panics are recovered into a structured `error` line with the stack as a field.
 
-Shipping to [Axiom](https://axiom.co) needs no code change — point a collector
-at the container's stdout, e.g.
-
-```bash
-docker run --log-driver=... voiceline            # or
-vector --config vector.yaml                       # source: stdin/docker_logs → sink: axiom
-```
+Shipping to [Axiom](https://axiom.co) needs no code change: stdout is
+newline-delimited JSON, so point Axiom's collector (or Vector, or the platform's
+log driver) at the container's stdout and the fields land as-is.
 
 Log levels map to status: `5xx` → error, `4xx` → warn, otherwise info, so an
 Axiom alert on `level:error service:voiceline` is enough for basic monitoring.
@@ -120,7 +116,7 @@ layer uses `httptest` recorders, and the LLM/sink clients are pointed at
 (`.github/workflows/ci.yml`) runs gofmt, `go vet`, build and `go test -race`
 with coverage on every push and PR.
 
-Coverage: 100% of the domain package, ~92% of the HTTP layer, 75% overall
+Coverage: 100% of the domain package, ~92% of the HTTP layer, 77% overall
 (`cmd/server` wiring is not unit tested).
 
 ## Design notes / scope
@@ -140,6 +136,7 @@ Coverage: 100% of the domain package, ~92% of the HTTP layer, 75% overall
   or Docker Compose. A production version would put step 2–3 on a worker queue
   and return `202` instead; for a 4-hour exercise the synchronous path is
   clearer.
-* **Verified locally** — full request path against a stub upstream (201/400/
-  413/415 + graceful shutdown). The live OpenAI → Notion round-trip is covered
-  by `httptest`-based tests, not exercised against the real APIs.
+* **Verified locally** — full request path against a stub upstream with a real
+  `.m4a` file (201/400/413/415 + graceful shutdown on SIGTERM). The live
+  OpenAI → Notion round-trip is covered by `httptest`-based tests, it was not
+  exercised against the real APIs.

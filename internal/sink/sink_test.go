@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ashwanisingh/voiceline-challenge/internal/config"
 	"github.com/ashwanisingh/voiceline-challenge/internal/sink"
 	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
 )
@@ -166,5 +167,25 @@ func TestNotionSaveReportsUpstreamStatus(t *testing.T) {
 		Save(context.Background(), testNote)
 	if err == nil || !strings.Contains(err.Error(), "status 401") {
 		t.Fatalf("Save() error = %v, want status 401", err)
+	}
+}
+
+func TestNewSelectsSinkFromConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config.Config
+		want string
+	}{
+		{name: "webhook", cfg: config.Config{Sink: config.SinkWebhook, WebhookURL: "https://x"}, want: "webhook"},
+		{name: "notion", cfg: config.Config{Sink: config.SinkNotion, NotionToken: "t", NotionParentPageID: "p"}, want: "notion"},
+		{name: "unset falls back to webhook", cfg: config.Config{}, want: "webhook"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sink.New(tt.cfg).Name(); got != tt.want {
+				t.Errorf("New().Name() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

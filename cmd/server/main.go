@@ -45,7 +45,7 @@ func run() error {
 		ChatModel:       cfg.ChatModel,
 		HTTPClient:      &http.Client{Timeout: cfg.ProcessTimeout},
 	})
-	noteSink := newSink(cfg)
+	noteSink := sink.New(cfg)
 	service := voiceline.NewService(llmClient, llmClient, noteSink, log)
 	handler := httpapi.NewVoicelineHandler(service, cfg.MaxAudioBytes, cfg.ProcessTimeout, log)
 
@@ -83,19 +83,4 @@ func run() error {
 
 	log.Info("server stopped")
 	return nil
-}
-
-// newSink builds the configured delivery target. cfg is already validated, so
-// the default branch is unreachable in practice.
-func newSink(cfg config.Config) voiceline.Sink {
-	client := &http.Client{Timeout: 30 * time.Second}
-	if cfg.Sink == config.SinkNotion {
-		return sink.NewNotion(sink.NotionOptions{
-			BaseURL:      cfg.NotionBaseURL,
-			Token:        cfg.NotionToken,
-			ParentPageID: cfg.NotionParentPageID,
-			HTTPClient:   client,
-		})
-	}
-	return sink.NewWebhook(cfg.WebhookURL, client)
 }
