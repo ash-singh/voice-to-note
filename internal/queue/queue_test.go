@@ -1,0 +1,843 @@
+package queue_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ash-singh/voice-to-note/internal/logging"
+	"github.com/ash-singh/voice-to-note/internal/memo"
+	"github.com/ash-singh/voice-to-note/internal/queue"
+)
+
+// fakeProcessor records what the worker handed it, so tests can assert on the
+// filename and the bytes without touching the network.
+type fakeProcessor struct {
+	mu        sync.Mutex
+	filenames []string
+	bodies    []string
+	result    memo.Result
+	err       error
+}
+
+func (f *fakeProcessor) Process(_ context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	body, err := io.ReadAll(audio)
+	if err != nil {
+		return memo.Result{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.filenames = append(f.filenames, filename)
+	f.bodies = append(f.bodies, string(body))
+	return f.result, f.err
+}
+
+func (f *fakeProcessor) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.filenames)
+}
+
+func newTestQueue(t *testing.T, proc queue.Processor) *queue.Queue {
+	t.Helper()
+	q, err := queue.New(queue.Options{Dir: t.TempDir(), Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	return q
+}
+
+// Claiming is the load-bearing property: the queue is safe for concurrent
+// workers only because a job is owned by whoever wins the rename.
+func TestProcessNextClaimsAJobExactlyOnce(t *testing.T) {
+	proc := &fakeProcessor{}
+	q := newTestQueue(t, proc)
+	if _, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	const workers = 4
+	claimed := make([]bool, workers)
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claimed[i], errs[i] = q.ProcessNext(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	wins := 0
+	for i := range workers {
+		if errs[i] != nil {
+			t.Fatalf("worker %d: ProcessNext: %v", i, errs[i])
+		}
+		if claimed[i] {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Errorf("workers reporting a claimed job = %d, want 1", wins)
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// openai.go infers the audio format from the multipart filename, so the queue
+// must not drop the extension when it renames the upload to a job id.
+func TestProcessNextPassesTheAudioAndItsExtension(t *testing.T) {
+	proc := &fakeProcessor{}
+	q := newTestQueue(t, proc)
+	if _, err := q.Enqueue("Voice Memo 3.m4a", strings.NewReader("audio bytes")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	if got := len(proc.filenames); got != 1 {
+		t.Fatalf("Process calls = %d, want 1", got)
+	}
+	if got := filepath.Ext(proc.filenames[0]); got != ".m4a" {
+		t.Errorf("filename %q has extension %q, want %q", proc.filenames[0], got, ".m4a")
+	}
+	if got := proc.bodies[0]; got != "audio bytes" {
+		t.Errorf("audio = %q, want %q", got, "audio bytes")
+	}
+}
+
+// Async processing removes the response body that carried the note, so the
+// outcome has to be recorded somewhere the caller can read it back later.
+func TestProcessNextRecordsTheResult(t *testing.T) {
+	want := memo.Result{
+		Note:    memo.Note{Title: "Invoice", ActionItems: []string{"Call Anna"}},
+		Sink:    "notion",
+		SinkRef: "https://notion.so/page",
+	}
+	proc := &fakeProcessor{result: want}
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{Dir: dir, Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "done", id+".json"))
+	if err != nil {
+		t.Fatalf("read recorded result: %v", err)
+	}
+	var got memo.Result
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode recorded result: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("recorded result = %+v, want %+v", got, want)
+	}
+}
+
+// A client retrying an upload it already got a 202 for must not cause the memo
+// to be transcribed and delivered a second time.
+func TestEnqueueIsIdempotentForACompletedJob(t *testing.T) {
+	proc := &fakeProcessor{}
+	q := newTestQueue(t, proc)
+	audio := "audio bytes"
+	first, err := q.Enqueue("memo.m4a", strings.NewReader(audio))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	second, err := q.Enqueue("memo.m4a", strings.NewReader(audio))
+	if err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+
+	if second != first {
+		t.Errorf("second Enqueue id = %q, want the first id %q", second, first)
+	}
+	claimed, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after re-Enqueue: %v", err)
+	}
+	if claimed {
+		t.Error("re-enqueueing a completed job produced new work, want none")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// blockingReader delivers its first half, then waits until released, so a test
+// can inspect the queue while an upload is still streaming in.
+type blockingReader struct {
+	rest     string
+	started  chan struct{}
+	release  chan struct{}
+	sentHead bool
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	if !b.sentHead {
+		b.sentHead = true
+		close(b.started)
+		return copy(p, "first half "), nil
+	}
+	<-b.release
+	if b.rest == "" {
+		return 0, io.EOF
+	}
+	n := copy(p, b.rest)
+	b.rest = b.rest[n:]
+	return n, nil
+}
+
+// An upload in progress must be invisible to workers: a job appears in pending
+// only once all of its bytes are on disk, otherwise a worker transcribes a
+// truncated recording.
+func TestEnqueueHidesAPartialUpload(t *testing.T) {
+	proc := &fakeProcessor{}
+	q := newTestQueue(t, proc)
+	audio := &blockingReader{rest: "second half", started: make(chan struct{}), release: make(chan struct{})}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.Enqueue("memo.m4a", audio)
+		done <- err
+	}()
+	<-audio.started
+
+	claimed, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext mid-upload: %v", err)
+	}
+	if claimed {
+		t.Error("a worker claimed a job while its upload was still streaming")
+	}
+
+	close(audio.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext after upload: %v", err)
+	}
+	if got := proc.bodies[0]; got != "first half second half" {
+		t.Errorf("audio = %q, want the whole upload", got)
+	}
+}
+
+// gatedProcessor blocks inside Process until released, so a test can enqueue
+// while a job is genuinely in flight.
+type gatedProcessor struct {
+	fakeProcessor
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	// Once, so an unexpected second call fails an assertion rather than
+	// panicking on a closed channel.
+	g.once.Do(func() { close(g.started) })
+	<-g.release
+	return g.fakeProcessor.Process(ctx, filename, audio)
+}
+
+// The duplicate that costs real money: re-uploading while the first copy is
+// mid-flight must not queue a second delivery to the sink.
+func TestEnqueueIsIdempotentWhileAJobIsInFlight(t *testing.T) {
+	proc := &gatedProcessor{started: make(chan struct{}), release: make(chan struct{})}
+	q := newTestQueue(t, proc)
+	audio := "audio bytes"
+	if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	running := make(chan error, 1)
+	go func() {
+		_, err := q.ProcessNext(context.Background())
+		running <- err
+	}()
+	<-proc.started
+
+	if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+
+	close(proc.release)
+	if err := <-running; err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+	claimed, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after re-Enqueue: %v", err)
+	}
+	if claimed {
+		t.Error("re-enqueueing an in-flight job produced new work, want none")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// signalProcessor reports each processed job, so tests can wait on progress
+// instead of sleeping.
+type signalProcessor struct {
+	fakeProcessor
+	calls chan string
+}
+
+func (s *signalProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	result, err := s.fakeProcessor.Process(ctx, filename, audio)
+	s.calls <- filename
+	return result, err
+}
+
+// Run is what makes the queue drain on its own: workers keep claiming jobs
+// until the server shuts down, at which point Run must return.
+func TestRunDrainsTheQueueAndStopsOnContextCancel(t *testing.T) {
+	proc := &signalProcessor{calls: make(chan string, 3)}
+	q := newTestQueue(t, proc)
+	for _, audio := range []string{"one", "two", "three"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 2)
+		close(stopped)
+	}()
+
+	for i := range 3 {
+		select {
+		case <-proc.calls:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of 3 jobs processed before timing out", i)
+		}
+	}
+
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+}
+
+// cancellingProcessor cancels the run context from inside the first job, the way
+// a SIGTERM arrives mid-flight.
+type cancellingProcessor struct {
+	fakeProcessor
+	cancel func()
+}
+
+func (c *cancellingProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	result, err := c.fakeProcessor.Process(ctx, filename, audio)
+	c.cancel()
+	return result, err
+}
+
+// On shutdown a worker must finish the job in hand and then stop, rather than
+// draining the whole backlog past its deadline.
+func TestRunStopsClaimingNewWorkOnceCancelled(t *testing.T) {
+	proc := &cancellingProcessor{}
+	q := newTestQueue(t, proc)
+	for _, audio := range []string{"one", "two"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	proc.cancel = cancel
+
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 1)
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("jobs processed after cancel = %d, want 1", got)
+	}
+}
+
+// Async processing only works if the caller can find out what happened, so
+// Lookup is the replacement for the note the 201 body used to carry.
+func TestLookupReportsJobState(t *testing.T) {
+	t.Run("queued", func(t *testing.T) {
+		q := newTestQueue(t, &fakeProcessor{})
+		id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+
+		got, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if got.ID != id || got.State != queue.StateQueued {
+			t.Errorf("status = %+v, want id %s in state %s", got, id, queue.StateQueued)
+		}
+		if got.Result != nil {
+			t.Errorf("queued job carries a result: %+v", got.Result)
+		}
+	})
+
+	t.Run("done carries the result", func(t *testing.T) {
+		want := memo.Result{Note: memo.Note{Title: "Invoice"}, Sink: "notion", SinkRef: "https://notion.so/page"}
+		q := newTestQueue(t, &fakeProcessor{result: want})
+		id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		if _, err := q.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext: %v", err)
+		}
+
+		got, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if got.State != queue.StateDone {
+			t.Errorf("state = %s, want %s", got.State, queue.StateDone)
+		}
+		if got.Result == nil || !reflect.DeepEqual(*got.Result, want) {
+			t.Errorf("result = %+v, want %+v", got.Result, want)
+		}
+	})
+
+	t.Run("unknown id", func(t *testing.T) {
+		q := newTestQueue(t, &fakeProcessor{})
+
+		_, err := q.Lookup("0123456789abcdef")
+
+		if !errors.Is(err, queue.ErrJobNotFound) {
+			t.Errorf("error = %v, want ErrJobNotFound", err)
+		}
+	})
+}
+
+// deadlineProcessor reports the deadline it was given.
+type deadlineProcessor struct {
+	fakeProcessor
+	hasDeadline bool
+	within      time.Duration
+}
+
+func (d *deadlineProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	deadline, ok := ctx.Deadline()
+	d.hasDeadline = ok
+	if ok {
+		d.within = time.Until(deadline)
+	}
+	return d.fakeProcessor.Process(ctx, filename, audio)
+}
+
+// PROCESS_TIMEOUT bounds the whole pipeline. Once the work moves off the request
+// there is no request context to carry it, so the queue has to apply it.
+func TestProcessNextBoundsAJobByTheProcessTimeout(t *testing.T) {
+	proc := &deadlineProcessor{}
+	q, err := queue.New(queue.Options{Dir: t.TempDir(), Processor: proc, Timeout: 90 * time.Second, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	if _, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	if !proc.hasDeadline {
+		t.Fatal("the job context has no deadline, so a stuck pipeline holds a worker forever")
+	}
+	if proc.within <= 0 || proc.within > 90*time.Second {
+		t.Errorf("deadline is %v away, want it within the 90s timeout", proc.within)
+	}
+}
+
+// taggingProcessor captures the correlation id the queue put on the job context.
+type taggingProcessor struct {
+	fakeProcessor
+	requestID string
+}
+
+func (p *taggingProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	p.requestID = logging.RequestIDFrom(ctx)
+	return p.fakeProcessor.Process(ctx, filename, audio)
+}
+
+// The request that enqueued the job is gone, so its request id cannot correlate
+// the worker's log lines. The job id has to take over, or "voice memo stored"
+// lands in the log with nothing tying it to anything.
+func TestProcessNextCorrelatesLogsWithTheJobID(t *testing.T) {
+	proc := &taggingProcessor{}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	if !strings.Contains(proc.requestID, id) {
+		t.Errorf("job context request id = %q, want it to contain the job id %q", proc.requestID, id)
+	}
+}
+
+// A rate limited transcription is the common failure, and it is worth retrying —
+// but not immediately, or the worker spins through the backlog burning quota.
+func TestProcessNextReschedulesAFailedJobForLater(t *testing.T) {
+	proc := &fakeProcessor{err: errors.New("whisper 429")}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claimed, err := q.ProcessNext(context.Background())
+	if !claimed {
+		t.Fatal("the job was not claimed")
+	}
+	if err == nil {
+		t.Fatal("ProcessNext hid the processing failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after failure: %v", err)
+	}
+	if status.State != queue.StateQueued {
+		t.Errorf("state = %s, want %s: a retryable failure belongs back in the queue", status.State, queue.StateQueued)
+	}
+	again, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext while backing off: %v", err)
+	}
+	if again {
+		t.Error("the job was retried immediately, want it deferred by the backoff")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// A failed delivery must not be retried blindly — the sink may have stored the
+// note already — and it must not vanish either: a 404 for work that ran is worse
+// than a visible failure.
+func TestProcessNextDeadLettersASinkFailureWithAReason(t *testing.T) {
+	proc := &fakeProcessor{err: &memo.SinkError{Sink: "notion", Err: errors.New("502")}}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the delivery failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after dead letter: %v", err)
+	}
+	if status.State != queue.StateFailed {
+		t.Errorf("state = %s, want %s", status.State, queue.StateFailed)
+	}
+	if !strings.Contains(status.Reason, "notion") {
+		t.Errorf("reason = %q, want it to name the sink", status.Reason)
+	}
+	again, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after dead letter: %v", err)
+	}
+	if again {
+		t.Error("a dead lettered job was retried, want it left for a human")
+	}
+}
+
+// seedJob writes a job file straight into pending, which is how a test reaches a
+// state that would otherwise take several real backoff windows to arrive at.
+func seedJob(t *testing.T, dir, name, audio string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "pending", name), []byte(audio), 0o640); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+}
+
+// Retrying forever turns one broken upload into permanent load on the LLM API.
+func TestProcessNextGivesUpAfterMaxAttempts(t *testing.T) {
+	proc := &fakeProcessor{err: errors.New("whisper 500")}
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{Dir: dir, Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	// A job that has already failed twice, due now.
+	const id = "abcdef1234567890"
+	seedJob(t, dir, "0000000001-2-"+id+".m4a", "audio bytes")
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the processing failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after giving up: %v", err)
+	}
+	if status.State != queue.StateFailed {
+		t.Errorf("state = %s, want %s", status.State, queue.StateFailed)
+	}
+	if !strings.Contains(status.Reason, "gave up") {
+		t.Errorf("reason = %q, want it to say the attempts ran out", status.Reason)
+	}
+}
+
+// A crash leaves jobs sitting in active. On restart they cannot simply be
+// retried: the note may already have reached the sink. But a job whose result was
+// recorded before the crash is finished, and needs no attention at all.
+func TestRecoverSeparatesFinishedJobsFromInterruptedOnes(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{Dir: dir, Processor: &fakeProcessor{}, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	const finished, interrupted = "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"
+	for _, id := range []string{finished, interrupted} {
+		if err := os.WriteFile(filepath.Join(dir, "active", "0000000001-0-"+id+".m4a"), []byte("audio"), 0o640); err != nil {
+			t.Fatalf("seed active job: %v", err)
+		}
+	}
+	// The crash happened after this one's result was written.
+	body, _ := json.Marshal(memo.Result{Sink: "notion", SinkRef: "https://notion.so/page"})
+	if err := os.WriteFile(filepath.Join(dir, "done", finished+".json"), body, 0o640); err != nil {
+		t.Fatalf("seed result: %v", err)
+	}
+
+	if err := q.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	got, err := q.Lookup(finished)
+	if err != nil {
+		t.Fatalf("Lookup finished job: %v", err)
+	}
+	if got.State != queue.StateDone {
+		t.Errorf("finished job state = %s, want %s", got.State, queue.StateDone)
+	}
+	got, err = q.Lookup(interrupted)
+	if err != nil {
+		t.Fatalf("Lookup interrupted job: %v", err)
+	}
+	if got.State != queue.StateFailed {
+		t.Errorf("interrupted job state = %s, want %s", got.State, queue.StateFailed)
+	}
+	if !strings.Contains(got.Reason, "interrupted") {
+		t.Errorf("reason = %q, want it to say the job was interrupted", got.Reason)
+	}
+	claimed, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after recovery: %v", err)
+	}
+	if claimed {
+		t.Error("recovery queued work, want interrupted jobs left for a human")
+	}
+}
+
+// Without a ceiling the queue absorbs an unbounded flood: 5k uploads is 5k files
+// of up to MAX_AUDIO_BYTES each, and a backlog no worker pool can clear.
+func TestEnqueueRefusesWorkBeyondTheDepthLimit(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: &fakeProcessor{},
+		Timeout:   time.Minute,
+		MaxDepth:  2,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	for _, audio := range []string{"one", "two"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue(%q): %v", audio, err)
+		}
+	}
+
+	_, err = q.Enqueue("memo.m4a", strings.NewReader("three"))
+
+	if !errors.Is(err, queue.ErrQueueFull) {
+		t.Fatalf("error = %v, want ErrQueueFull", err)
+	}
+	// A refused upload must not leave anything behind to leak disk.
+	spooled, err := filepath.Glob(filepath.Join(dir, "tmp", "*"))
+	if err != nil {
+		t.Fatalf("glob tmp: %v", err)
+	}
+	if len(spooled) != 0 {
+		t.Errorf("refused upload left %d spool files behind", len(spooled))
+	}
+}
+
+// The failure log is the only place a dead lettered job announces itself, so it
+// is the one line that most needs the job id on it.
+func TestFailureLogsCarryTheJobID(t *testing.T) {
+	var logs bytes.Buffer
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: &fakeProcessor{err: errors.New("whisper 500")},
+		Timeout:   time.Minute,
+		Logger:    logging.New("debug", &logs),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the failure")
+	}
+
+	if !strings.Contains(logs.String(), id) {
+		t.Errorf("no log line mentions job %s: %s", id, logs.String())
+	}
+}
+
+// Recovery has to be part of starting the workers. Wired into main instead, it
+// can be deleted without a single test noticing.
+func TestRunRecoversInterruptedJobsBeforeWorkingOnAnything(t *testing.T) {
+	dir := t.TempDir()
+	proc := &fakeProcessor{}
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: proc,
+		Timeout:   time.Minute,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	// Left behind by a crash: in flight, with no recorded result.
+	const id = "cccccccccccccccc"
+	if err := os.WriteFile(filepath.Join(dir, "active", "0000000001-0-"+id+".m4a"), []byte("audio"), 0o640); err != nil {
+		t.Fatalf("seed active job: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 1)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if status.State == queue.StateFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job state = %s, want %s: Run did not recover it", status.State, queue.StateFailed)
+		}
+	}
+	if got := proc.callCount(); got != 0 {
+		t.Errorf("Process calls = %d, want 0: an interrupted job must not be retried", got)
+	}
+}
+
+// failed/ keeps the audio so a job can be replayed once whatever broke is fixed.
+// The README documents that replay as moving the file back into pending, so the
+// stale reason file must not survive it.
+func TestReplayingADeadLetteredJobClearsItsReason(t *testing.T) {
+	dir := t.TempDir()
+	proc := &fakeProcessor{err: &memo.SinkError{Sink: "notion", Err: errors.New("502")}}
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: proc,
+		Timeout:   time.Minute,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the delivery failure")
+	}
+
+	// The operator fixes the sink and replays the job.
+	parked, err := filepath.Glob(filepath.Join(dir, "failed", "*-"+id+".*"))
+	if err != nil || len(parked) != 1 {
+		t.Fatalf("want one parked job file, got %v (err %v)", parked, err)
+	}
+	if err := os.Rename(parked[0], filepath.Join(dir, "pending", filepath.Base(parked[0]))); err != nil {
+		t.Fatalf("replay job: %v", err)
+	}
+	proc.err = nil
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext after replay: %v", err)
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after replay: %v", err)
+	}
+	if status.State != queue.StateDone {
+		t.Errorf("state = %s, want %s", status.State, queue.StateDone)
+	}
+	if status.Reason != "" {
+		t.Errorf("reason = %q, want it cleared by the successful replay", status.Reason)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failed", id+".reason")); !os.IsNotExist(err) {
+		t.Errorf("stale reason file survived the replay (stat err = %v)", err)
+	}
+}

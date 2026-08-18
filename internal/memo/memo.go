@@ -38,6 +38,17 @@ type Sink interface {
 // ErrEmptyTranscript means the audio carried no speech worth storing.
 var ErrEmptyTranscript = errors.New("transcript is empty")
 
+// SinkError reports a failure to submit the note. It is distinguished from the
+// earlier steps because a retry after it may deliver the same note twice: the
+// sink can fail having already stored the page.
+type SinkError struct {
+	Sink string
+	Err  error
+}
+
+func (e *SinkError) Error() string { return fmt.Sprintf("save to %s: %v", e.Sink, e.Err) }
+func (e *SinkError) Unwrap() error { return e.Err }
+
 // Result is what the API returns for one processed voice memo.
 type Result struct {
 	Note    Note   `json:"note"`
@@ -77,7 +88,7 @@ func (s *Service) Process(ctx context.Context, filename string, audio io.Reader)
 
 	ref, err := s.sink.Save(ctx, note)
 	if err != nil {
-		return Result{}, fmt.Errorf("save to %s: %w", s.sink.Name(), err)
+		return Result{}, &SinkError{Sink: s.sink.Name(), Err: err}
 	}
 	s.log.InfoContext(ctx, "voice memo stored",
 		"sink", s.sink.Name(), "sink_ref", ref, "action_items", len(note.ActionItems))
