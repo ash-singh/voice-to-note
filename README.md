@@ -132,11 +132,20 @@ Coverage: 100% of the domain package, ~92% of the HTTP layer, 77% overall
   and outbound calls inherit a per-request timeout context.
 * **Streaming** — the upload is piped straight into the multipart request to the
   speech-to-text API, so a 25 MiB memo is not buffered twice.
+* **One sink at a time** — `SINK` picks a single destination. Fan-out is a
+  ~30-line composite that implements `memo.Sink` itself (`Save` loops, `Name`
+  joins), so `memo`, `httpapi` and `cmd/server` would not change. The work is
+  not the loop, it is the three decisions it forces: whether one failed
+  delivery fails the whole request (a 5xx invites a retry that duplicates the
+  page that *did* save), whether `Result.SinkRef` becomes `[]Delivery` and
+  breaks the response contract, and sequential vs `errgroup`. Left as one sink
+  until a second destination is actually wanted.
 * **Deliberately left out** — no auth, queue, retries, rate limiting, database
   or Docker Compose. A production version would put step 2–3 on a worker queue
   and return `202` instead; for a 4-hour exercise the synchronous path is
   clearer.
 * **Verified locally** — full request path against a stub upstream with a real
-  `.m4a` file (201/400/413/415 + graceful shutdown on SIGTERM). The live
-  OpenAI → Notion round-trip is covered by `httptest`-based tests, it was not
-  exercised against the real APIs.
+  `.m4a` file (201/400/413/415 + graceful shutdown on SIGTERM), plus a live
+  round-trip against the real OpenAI and Notion APIs: `testdata/memo.m4a` →
+  whisper-1 → gpt-4o-mini → a Notion page with the summary paragraph, one
+  `to_do` per action item and the transcript.
