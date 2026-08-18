@@ -48,7 +48,13 @@ func run() error {
 	})
 	noteSink := sink.New(cfg)
 	service := memo.NewService(llmClient, llmClient, noteSink, log)
-	jobs, err := queue.New(cfg.QueueDir, service, cfg.ProcessTimeout, log)
+	jobs, err := queue.New(queue.Options{
+		Dir:       cfg.QueueDir,
+		Processor: service,
+		Timeout:   cfg.ProcessTimeout,
+		MaxDepth:  cfg.QueueMaxDepth,
+		Logger:    log,
+	})
 	if err != nil {
 		return err
 	}

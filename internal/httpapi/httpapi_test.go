@@ -228,7 +228,7 @@ func TestQueuedJobCompletesAfterTheRequestReturns(t *testing.T) {
 	proc := &recordingProcessor{result: memo.Result{Note: memo.Note{Title: "Invoice"}, Sink: "webhook", SinkRef: "row-1"}}
 	var logs bytes.Buffer
 	log := logging.New("debug", &logs)
-	q, err := queue.New(t.TempDir(), proc, time.Minute, log)
+	q, err := queue.New(queue.Options{Dir: t.TempDir(), Processor: proc, Timeout: time.Minute, Logger: log})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -320,5 +320,25 @@ func TestCreateNoteReportsTheRealStateOfADeduplicatedJob(t *testing.T) {
 	}
 	if got.Data.State != string(queue.StateDone) {
 		t.Errorf("state = %q, want %q", got.Data.State, queue.StateDone)
+	}
+}
+
+// A full queue is the one failure a client can usefully act on, so it must not
+// arrive as a generic 500: 429 plus Retry-After tells it to slow down.
+func TestCreateNoteReturns429WhenTheQueueIsFull(t *testing.T) {
+	q := &fakeQueue{enqueueErr: queue.ErrQueueFull}
+	router, _ := newServer(t, q, 1<<20)
+	body, contentType := audioBody(t, "audio", "memo.m4a", "fake-audio")
+	req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (body %s)", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After is empty, so a client has nothing to back off by")
 	}
 }

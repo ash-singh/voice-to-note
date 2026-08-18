@@ -29,8 +29,9 @@ type Config struct {
 	TranscribeModel string
 	ChatModel       string
 
-	QueueDir     string
-	QueueWorkers int
+	QueueDir      string
+	QueueWorkers  int
+	QueueMaxDepth int
 
 	Sink               string
 	WebhookURL         string
@@ -56,6 +57,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("QUEUE_WORKERS: %w", err)
 	}
+	queueMaxDepth, err := strconv.Atoi(env("QUEUE_MAX_DEPTH", "100"))
+	if err != nil {
+		return Config{}, fmt.Errorf("QUEUE_MAX_DEPTH: %w", err)
+	}
 
 	cfg := Config{
 		Addr:            env("ADDR", ":8080"),
@@ -69,8 +74,9 @@ func Load() (Config, error) {
 		TranscribeModel: env("TRANSCRIBE_MODEL", "whisper-1"),
 		ChatModel:       env("CHAT_MODEL", "gpt-4o-mini"),
 
-		QueueDir:     env("QUEUE_DIR", "queue"),
-		QueueWorkers: queueWorkers,
+		QueueDir:      env("QUEUE_DIR", "queue"),
+		QueueWorkers:  queueWorkers,
+		QueueMaxDepth: queueMaxDepth,
 
 		Sink:               strings.ToLower(env("SINK", SinkWebhook)),
 		WebhookURL:         os.Getenv("WEBHOOK_URL"),

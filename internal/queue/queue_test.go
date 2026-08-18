@@ -49,7 +49,7 @@ func (f *fakeProcessor) callCount() int {
 
 func newTestQueue(t *testing.T, proc queue.Processor) *queue.Queue {
 	t.Helper()
-	q, err := queue.New(t.TempDir(), proc, time.Minute, slog.New(slog.DiscardHandler))
+	q, err := queue.New(queue.Options{Dir: t.TempDir(), Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestProcessNextRecordsTheResult(t *testing.T) {
 	}
 	proc := &fakeProcessor{result: want}
 	dir := t.TempDir()
-	q, err := queue.New(dir, proc, time.Minute, slog.New(slog.DiscardHandler))
+	q, err := queue.New(queue.Options{Dir: dir, Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -467,7 +467,7 @@ func (d *deadlineProcessor) Process(ctx context.Context, filename string, audio 
 // there is no request context to carry it, so the queue has to apply it.
 func TestProcessNextBoundsAJobByTheProcessTimeout(t *testing.T) {
 	proc := &deadlineProcessor{}
-	q, err := queue.New(t.TempDir(), proc, 90*time.Second, slog.New(slog.DiscardHandler))
+	q, err := queue.New(queue.Options{Dir: t.TempDir(), Processor: proc, Timeout: 90 * time.Second, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -602,7 +602,7 @@ func seedJob(t *testing.T, dir, name, audio string) {
 func TestProcessNextGivesUpAfterMaxAttempts(t *testing.T) {
 	proc := &fakeProcessor{err: errors.New("whisper 500")}
 	dir := t.TempDir()
-	q, err := queue.New(dir, proc, time.Minute, slog.New(slog.DiscardHandler))
+	q, err := queue.New(queue.Options{Dir: dir, Processor: proc, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -631,7 +631,7 @@ func TestProcessNextGivesUpAfterMaxAttempts(t *testing.T) {
 // recorded before the crash is finished, and needs no attention at all.
 func TestRecoverSeparatesFinishedJobsFromInterruptedOnes(t *testing.T) {
 	dir := t.TempDir()
-	q, err := queue.New(dir, &fakeProcessor{}, time.Minute, slog.New(slog.DiscardHandler))
+	q, err := queue.New(queue.Options{Dir: dir, Processor: &fakeProcessor{}, Timeout: time.Minute, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("queue.New: %v", err)
 	}
@@ -674,5 +674,40 @@ func TestRecoverSeparatesFinishedJobsFromInterruptedOnes(t *testing.T) {
 	}
 	if claimed {
 		t.Error("recovery queued work, want interrupted jobs left for a human")
+	}
+}
+
+// Without a ceiling the queue absorbs an unbounded flood: 5k uploads is 5k files
+// of up to MAX_AUDIO_BYTES each, and a backlog no worker pool can clear.
+func TestEnqueueRefusesWorkBeyondTheDepthLimit(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: &fakeProcessor{},
+		Timeout:   time.Minute,
+		MaxDepth:  2,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	for _, audio := range []string{"one", "two"} {
+		if _, err := q.Enqueue("memo.m4a", strings.NewReader(audio)); err != nil {
+			t.Fatalf("Enqueue(%q): %v", audio, err)
+		}
+	}
+
+	_, err = q.Enqueue("memo.m4a", strings.NewReader("three"))
+
+	if !errors.Is(err, queue.ErrQueueFull) {
+		t.Fatalf("error = %v, want ErrQueueFull", err)
+	}
+	// A refused upload must not leave anything behind to leak disk.
+	spooled, err := filepath.Glob(filepath.Join(dir, "tmp", "*"))
+	if err != nil {
+		t.Fatalf("glob tmp: %v", err)
+	}
+	if len(spooled) != 0 {
+		t.Errorf("refused upload left %d spool files behind", len(spooled))
 	}
 }

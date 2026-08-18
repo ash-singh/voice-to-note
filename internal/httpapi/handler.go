@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +16,10 @@ import (
 )
 
 const audioField = "audio"
+
+// retryAfterSeconds is what a client is told to wait when the queue is full. A
+// rough hint is enough: the point is that it backs off at all.
+const retryAfterSeconds = 30
 
 // allowedAudioExt mirrors the formats the speech-to-text API accepts.
 var allowedAudioExt = map[string]bool{
@@ -77,6 +82,11 @@ func (h *NoteHandler) Create(c *gin.Context) {
 
 	id, err := h.queue.Enqueue(filename, file)
 	if err != nil {
+		if errors.Is(err, queue.ErrQueueFull) {
+			c.Header("Retry-After", strconv.Itoa(retryAfterSeconds))
+			respondError(c, http.StatusTooManyRequests, "the queue is full, retry shortly")
+			return
+		}
 		_ = c.Error(err)
 		respondError(c, http.StatusInternalServerError, "could not accept the voice memo")
 		return

@@ -90,6 +90,10 @@ const (
 // since been swept.
 var ErrJobNotFound = errors.New("job not found")
 
+// ErrQueueFull means the backlog is at its configured depth. The caller should
+// back off rather than retry immediately.
+var ErrQueueFull = errors.New("queue is full")
+
 // Status is what a caller can learn about a job after the request that created
 // it has returned. Result is set once the job is done.
 type Status struct {
@@ -104,28 +108,50 @@ type Processor interface {
 	Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error)
 }
 
-// Queue is a directory of spooled jobs.
-type Queue struct {
-	dir     string
-	proc    Processor
-	timeout time.Duration
-	log     *slog.Logger
+// Options configures a Queue.
+type Options struct {
+	// Dir is the queue root; its subdirectories are created if missing.
+	Dir string
+	// Processor runs a job. Required.
+	Processor Processor
+	// Timeout bounds one job. The request that enqueued it has returned, so its
+	// context cannot carry the deadline.
+	Timeout time.Duration
+	// MaxDepth caps how many jobs may be waiting. Zero means no limit. The cap
+	// also bounds disk use, at MaxDepth times the upload size limit.
+	MaxDepth int
+	// Logger receives worker progress and failures. Required.
+	Logger *slog.Logger
 }
 
-// New prepares dir as a queue root. timeout bounds one job: the request that
-// enqueued it is long gone, so its context cannot carry the deadline.
-func New(dir string, proc Processor, timeout time.Duration, log *slog.Logger) (*Queue, error) {
+// Queue is a directory of spooled jobs.
+type Queue struct {
+	opts Options
+}
+
+// New prepares the queue root in opts.Dir.
+func New(opts Options) (*Queue, error) {
 	for _, sub := range []string{dirTmp, dirPending, dirActive, dirDone, dirFailed} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+		if err := os.MkdirAll(filepath.Join(opts.Dir, sub), 0o750); err != nil {
 			return nil, fmt.Errorf("prepare queue dir: %w", err)
 		}
 	}
-	return &Queue{dir: dir, proc: proc, timeout: timeout, log: log}, nil
+	return &Queue{opts: opts}, nil
 }
 
 // Enqueue spools audio and returns the job id. The id is a hash of the audio, so
 // the same recording submitted twice is the same job.
 func (q *Queue) Enqueue(filename string, audio io.Reader) (string, error) {
+	// Checked before the upload is spooled, so a flood is refused without first
+	// writing it to disk.
+	full, err := q.atCapacity()
+	if err != nil {
+		return "", err
+	}
+	if full {
+		return "", ErrQueueFull
+	}
+
 	spool, err := os.CreateTemp(q.path(dirTmp), "upload-*")
 	if err != nil {
 		return "", fmt.Errorf("spool upload: %w", err)
@@ -155,6 +181,18 @@ func (q *Queue) Enqueue(filename string, audio io.Reader) (string, error) {
 		return "", fmt.Errorf("enqueue job: %w", err)
 	}
 	return id, nil
+}
+
+// atCapacity reports whether the backlog has reached MaxDepth.
+func (q *Queue) atCapacity() (bool, error) {
+	if q.opts.MaxDepth <= 0 {
+		return false, nil
+	}
+	entries, err := os.ReadDir(q.path(dirPending))
+	if err != nil {
+		return false, fmt.Errorf("measure queue depth: %w", err)
+	}
+	return len(entries) >= q.opts.MaxDepth, nil
 }
 
 // known reports whether id is already queued, in flight or finished. The id is a
@@ -197,7 +235,7 @@ func (q *Queue) work(ctx context.Context) {
 		}
 		claimed, err := q.ProcessNext(ctx)
 		if err != nil {
-			q.log.ErrorContext(ctx, "job failed", "error", err)
+			q.opts.Logger.ErrorContext(ctx, "job failed", "error", err)
 		}
 		if claimed {
 			continue
@@ -224,7 +262,7 @@ func (q *Queue) Recover(ctx context.Context) error {
 		// A recorded result means the work finished and only the cleanup was
 		// lost, so the leftover file is all there is to discard.
 		if _, err := os.Stat(q.path(dirDone, id+".json")); err == nil {
-			q.log.InfoContext(ctx, "discarding a job that finished before the restart", "job_id", id)
+			q.opts.Logger.InfoContext(ctx, "discarding a job that finished before the restart", "job_id", id)
 			if err := os.Remove(q.path(dirActive, name)); err != nil {
 				return fmt.Errorf("discard finished job %s: %w", id, err)
 			}
@@ -236,7 +274,7 @@ func (q *Queue) Recover(ctx context.Context) error {
 		// Otherwise the job died somewhere between transcription and recording
 		// its result, so whether the note reached the sink is unknown. Retrying
 		// could duplicate it; a human decides.
-		q.log.WarnContext(ctx, "job interrupted by a restart, needs review", "job_id", id)
+		q.opts.Logger.WarnContext(ctx, "job interrupted by a restart, needs review", "job_id", id)
 		if err := q.deadLetter(name, id, "interrupted by a restart; check the sink before retrying"); err != nil {
 			return err
 		}
@@ -256,7 +294,7 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 		name := entry.Name()
 		due, attempt, _, err := parseJobName(name)
 		if err != nil {
-			q.log.ErrorContext(ctx, "ignoring malformed job file", "name", name, "error", err)
+			q.opts.Logger.ErrorContext(ctx, "ignoring malformed job file", "name", name, "error", err)
 			continue
 		}
 		if due.After(now) {
@@ -297,7 +335,7 @@ func (q *Queue) handleFailure(ctx context.Context, name string, attempt int, cau
 	}
 
 	retryAt := time.Now().Add(retryDelay(next))
-	q.log.WarnContext(ctx, "job failed, retrying later",
+	q.opts.Logger.WarnContext(ctx, "job failed, retrying later",
 		"attempt", next, "retry_at", retryAt.Format(time.RFC3339), "error", cause)
 	if err := os.Rename(q.path(dirActive, name), q.path(dirPending, jobName(retryAt, next, id, filepath.Ext(name)))); err != nil {
 		return errors.Join(cause, fmt.Errorf("reschedule job %s: %w", id, err))
@@ -324,10 +362,10 @@ func (q *Queue) run(ctx context.Context, name string) error {
 	// The submitting request is gone, so the job id becomes the correlation id
 	// every log record from this job carries.
 	ctx = logging.WithRequestID(ctx, "job-"+idOf(name))
-	ctx, cancel := context.WithTimeout(ctx, q.timeout)
+	ctx, cancel := context.WithTimeout(ctx, q.opts.Timeout)
 	defer cancel()
 
-	result, err := q.proc.Process(ctx, name, file)
+	result, err := q.opts.Processor.Process(ctx, name, file)
 	if err != nil {
 		return err
 	}
@@ -366,7 +404,7 @@ func idOf(name string) string {
 }
 
 func (q *Queue) path(elem ...string) string {
-	return filepath.Join(append([]string{q.dir}, elem...)...)
+	return filepath.Join(append([]string{q.opts.Dir}, elem...)...)
 }
 
 // Lookup reports the state of a job, and its result once it has one.
