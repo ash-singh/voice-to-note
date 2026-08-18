@@ -275,7 +275,7 @@ func (q *Queue) Recover(ctx context.Context) error {
 		// its result, so whether the note reached the sink is unknown. Retrying
 		// could duplicate it; a human decides.
 		q.opts.Logger.WarnContext(ctx, "job interrupted by a restart, needs review", "job_id", id)
-		if err := q.deadLetter(name, id, "interrupted by a restart; check the sink before retrying"); err != nil {
+		if err := q.deadLetter(ctx, name, id, "interrupted by a restart; check the sink before retrying"); err != nil {
 			return err
 		}
 	}
@@ -308,8 +308,13 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 			}
 			return false, fmt.Errorf("claim job: %w", err)
 		}
-		if err := q.run(ctx, name); err != nil {
-			return true, q.handleFailure(ctx, name, attempt, err)
+		// Tagged here rather than inside run, so the failure paths log the job
+		// id too: the submitting request is long gone by now.
+		jobCtx := logging.WithRequestID(ctx, "job-"+idOf(name))
+		if err := q.run(jobCtx, name); err != nil {
+			// Named in the error too, so the worker's own log line identifies the
+			// job without depending on the context tag.
+			return true, fmt.Errorf("job %s: %w", idOf(name), q.handleFailure(jobCtx, name, attempt, err))
 		}
 		return true, nil
 	}
@@ -327,11 +332,11 @@ func (q *Queue) handleFailure(ctx context.Context, name string, attempt int, cau
 	case errors.As(cause, &sinkErr):
 		// The sink may have stored the note before failing, so retrying risks a
 		// duplicate. A human decides this one.
-		return errors.Join(cause, q.deadLetter(name, id, "delivery to "+sinkErr.Sink+" failed and may have partly succeeded: "+cause.Error()))
+		return errors.Join(cause, q.deadLetter(ctx, name, id, "delivery to "+sinkErr.Sink+" failed and may have partly succeeded: "+cause.Error()))
 	case errors.Is(cause, memo.ErrEmptyTranscript):
-		return errors.Join(cause, q.deadLetter(name, id, cause.Error()))
+		return errors.Join(cause, q.deadLetter(ctx, name, id, cause.Error()))
 	case next >= maxAttempts:
-		return errors.Join(cause, q.deadLetter(name, id, fmt.Sprintf("gave up after %d attempts: %v", next, cause)))
+		return errors.Join(cause, q.deadLetter(ctx, name, id, fmt.Sprintf("gave up after %d attempts: %v", next, cause)))
 	}
 
 	retryAt := time.Now().Add(retryDelay(next))
@@ -343,8 +348,10 @@ func (q *Queue) handleFailure(ctx context.Context, name string, attempt int, cau
 	return cause
 }
 
-// deadLetter parks a job for a human, recording why it stopped.
-func (q *Queue) deadLetter(name, id, reason string) error {
+// deadLetter parks a job for a human, recording why it stopped. The audio stays
+// in failed/, so a job can be replayed by moving it back into pending.
+func (q *Queue) deadLetter(ctx context.Context, name, id, reason string) error {
+	q.opts.Logger.ErrorContext(ctx, "job dead lettered", "reason", reason)
 	if err := os.Rename(q.path(dirActive, name), q.path(dirFailed, name)); err != nil {
 		return fmt.Errorf("dead letter job %s: %w", id, err)
 	}
@@ -359,9 +366,6 @@ func (q *Queue) run(ctx context.Context, name string) error {
 	}
 	defer file.Close()
 
-	// The submitting request is gone, so the job id becomes the correlation id
-	// every log record from this job carries.
-	ctx = logging.WithRequestID(ctx, "job-"+idOf(name))
 	ctx, cancel := context.WithTimeout(ctx, q.opts.Timeout)
 	defer cancel()
 

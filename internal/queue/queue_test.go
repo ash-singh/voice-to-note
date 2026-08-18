@@ -1,6 +1,7 @@
 package queue_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -709,5 +710,33 @@ func TestEnqueueRefusesWorkBeyondTheDepthLimit(t *testing.T) {
 	}
 	if len(spooled) != 0 {
 		t.Errorf("refused upload left %d spool files behind", len(spooled))
+	}
+}
+
+// The failure log is the only place a dead lettered job announces itself, so it
+// is the one line that most needs the job id on it.
+func TestFailureLogsCarryTheJobID(t *testing.T) {
+	var logs bytes.Buffer
+	dir := t.TempDir()
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: &fakeProcessor{err: errors.New("whisper 500")},
+		Timeout:   time.Minute,
+		Logger:    logging.New("debug", &logs),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the failure")
+	}
+
+	if !strings.Contains(logs.String(), id) {
+		t.Errorf("no log line mentions job %s: %s", id, logs.String())
 	}
 }
