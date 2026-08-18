@@ -30,7 +30,7 @@ Fastest usable config: an OpenAI key plus a fresh URL from
 needed to see the note arrive.
 
 ```bash
-curl -F "audio=@memo.m4a" http://localhost:8080/v1/notes
+curl -F "audio=@testdata/memo.m4a" http://localhost:8080/v1/notes
 ```
 
 ```json
@@ -48,8 +48,8 @@ curl -F "audio=@memo.m4a" http://localhost:8080/v1/notes
 }
 ```
 
-Record a test memo on macOS:
-`say -o memo.aiff "Call Anna tomorrow about the unpaid invoice" && afconvert -f mp4f -d aac memo.aiff memo.m4a`
+`testdata/memo.m4a` is the recording above. Record your own on macOS:
+`say -o memo.aiff "..." && afconvert -f mp4f -d aac memo.aiff memo.m4a`
 
 ## API
 
