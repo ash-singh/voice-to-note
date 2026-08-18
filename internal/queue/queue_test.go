@@ -517,3 +517,162 @@ func TestProcessNextCorrelatesLogsWithTheJobID(t *testing.T) {
 		t.Errorf("job context request id = %q, want it to contain the job id %q", proc.requestID, id)
 	}
 }
+
+// A rate limited transcription is the common failure, and it is worth retrying —
+// but not immediately, or the worker spins through the backlog burning quota.
+func TestProcessNextReschedulesAFailedJobForLater(t *testing.T) {
+	proc := &fakeProcessor{err: errors.New("whisper 429")}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	claimed, err := q.ProcessNext(context.Background())
+	if !claimed {
+		t.Fatal("the job was not claimed")
+	}
+	if err == nil {
+		t.Fatal("ProcessNext hid the processing failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after failure: %v", err)
+	}
+	if status.State != queue.StateQueued {
+		t.Errorf("state = %s, want %s: a retryable failure belongs back in the queue", status.State, queue.StateQueued)
+	}
+	again, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext while backing off: %v", err)
+	}
+	if again {
+		t.Error("the job was retried immediately, want it deferred by the backoff")
+	}
+	if got := proc.callCount(); got != 1 {
+		t.Errorf("Process calls = %d, want 1", got)
+	}
+}
+
+// A failed delivery must not be retried blindly — the sink may have stored the
+// note already — and it must not vanish either: a 404 for work that ran is worse
+// than a visible failure.
+func TestProcessNextDeadLettersASinkFailureWithAReason(t *testing.T) {
+	proc := &fakeProcessor{err: &memo.SinkError{Sink: "notion", Err: errors.New("502")}}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the delivery failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after dead letter: %v", err)
+	}
+	if status.State != queue.StateFailed {
+		t.Errorf("state = %s, want %s", status.State, queue.StateFailed)
+	}
+	if !strings.Contains(status.Reason, "notion") {
+		t.Errorf("reason = %q, want it to name the sink", status.Reason)
+	}
+	again, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after dead letter: %v", err)
+	}
+	if again {
+		t.Error("a dead lettered job was retried, want it left for a human")
+	}
+}
+
+// seedJob writes a job file straight into pending, which is how a test reaches a
+// state that would otherwise take several real backoff windows to arrive at.
+func seedJob(t *testing.T, dir, name, audio string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "pending", name), []byte(audio), 0o640); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+}
+
+// Retrying forever turns one broken upload into permanent load on the LLM API.
+func TestProcessNextGivesUpAfterMaxAttempts(t *testing.T) {
+	proc := &fakeProcessor{err: errors.New("whisper 500")}
+	dir := t.TempDir()
+	q, err := queue.New(dir, proc, time.Minute, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	// A job that has already failed twice, due now.
+	const id = "abcdef1234567890"
+	seedJob(t, dir, "0000000001-2-"+id+".m4a", "audio bytes")
+
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the processing failure")
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after giving up: %v", err)
+	}
+	if status.State != queue.StateFailed {
+		t.Errorf("state = %s, want %s", status.State, queue.StateFailed)
+	}
+	if !strings.Contains(status.Reason, "gave up") {
+		t.Errorf("reason = %q, want it to say the attempts ran out", status.Reason)
+	}
+}
+
+// A crash leaves jobs sitting in active. On restart they cannot simply be
+// retried: the note may already have reached the sink. But a job whose result was
+// recorded before the crash is finished, and needs no attention at all.
+func TestRecoverSeparatesFinishedJobsFromInterruptedOnes(t *testing.T) {
+	dir := t.TempDir()
+	q, err := queue.New(dir, &fakeProcessor{}, time.Minute, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	const finished, interrupted = "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"
+	for _, id := range []string{finished, interrupted} {
+		if err := os.WriteFile(filepath.Join(dir, "active", "0000000001-0-"+id+".m4a"), []byte("audio"), 0o640); err != nil {
+			t.Fatalf("seed active job: %v", err)
+		}
+	}
+	// The crash happened after this one's result was written.
+	body, _ := json.Marshal(memo.Result{Sink: "notion", SinkRef: "https://notion.so/page"})
+	if err := os.WriteFile(filepath.Join(dir, "done", finished+".json"), body, 0o640); err != nil {
+		t.Fatalf("seed result: %v", err)
+	}
+
+	if err := q.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	got, err := q.Lookup(finished)
+	if err != nil {
+		t.Fatalf("Lookup finished job: %v", err)
+	}
+	if got.State != queue.StateDone {
+		t.Errorf("finished job state = %s, want %s", got.State, queue.StateDone)
+	}
+	got, err = q.Lookup(interrupted)
+	if err != nil {
+		t.Fatalf("Lookup interrupted job: %v", err)
+	}
+	if got.State != queue.StateFailed {
+		t.Errorf("interrupted job state = %s, want %s", got.State, queue.StateFailed)
+	}
+	if !strings.Contains(got.Reason, "interrupted") {
+		t.Errorf("reason = %q, want it to say the job was interrupted", got.Reason)
+	}
+	claimed, err := q.ProcessNext(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessNext after recovery: %v", err)
+	}
+	if claimed {
+		t.Error("recovery queued work, want interrupted jobs left for a human")
+	}
+}

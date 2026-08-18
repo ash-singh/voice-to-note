@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,11 +30,49 @@ const (
 	dirPending = "pending"
 	dirActive  = "active"
 	dirDone    = "done"
+	dirFailed  = "failed"
 )
+
+// maxAttempts bounds retries of a job. Fixed rather than configurable: it is not
+// a value this service has any reason to tune per deployment yet.
+const maxAttempts = 3
+
+// retryDelay backs off exponentially from 30s, which is the right order of
+// magnitude for the rate limits that cause most retries.
+func retryDelay(attempt int) time.Duration {
+	return 30 * time.Second << (attempt - 1)
+}
 
 // idBytes is how much of the content hash names a job. 8 bytes is ample to keep
 // distinct recordings apart, and a short id stays readable in logs and URLs.
 const idBytes = 8
+
+// A job file is named "<due>-<attempt>-<id><ext>": the due time comes first and
+// is zero padded, so the lexical order os.ReadDir returns is also the order the
+// jobs become due, and the oldest due job is simply the first entry.
+const dueDigits = 10
+
+func jobName(due time.Time, attempt int, id, ext string) string {
+	return fmt.Sprintf("%0*d-%d-%s%s", dueDigits, due.Unix(), attempt, id, ext)
+}
+
+// parseJobName splits a job filename back into its parts.
+func parseJobName(name string) (due time.Time, attempt int, id string, err error) {
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+	parts := strings.SplitN(base, "-", 3)
+	if len(parts) != 3 {
+		return time.Time{}, 0, "", fmt.Errorf("malformed job name %q", name)
+	}
+	sec, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, 0, "", fmt.Errorf("malformed job name %q: %w", name, err)
+	}
+	attempt, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return time.Time{}, 0, "", fmt.Errorf("malformed job name %q: %w", name, err)
+	}
+	return time.Unix(sec, 0), attempt, parts[2], nil
+}
 
 // State is where a job has got to.
 type State string
@@ -44,6 +83,7 @@ const (
 	StateQueued     State = "queued"
 	StateProcessing State = "processing"
 	StateDone       State = "done"
+	StateFailed     State = "failed"
 )
 
 // ErrJobNotFound means no job with that id was ever enqueued, or its record has
@@ -56,6 +96,7 @@ type Status struct {
 	ID     string       `json:"id"`
 	State  State        `json:"state"`
 	Result *memo.Result `json:"result,omitempty"`
+	Reason string       `json:"reason,omitempty"`
 }
 
 // Processor is the domain entry point a worker drives.
@@ -74,7 +115,7 @@ type Queue struct {
 // New prepares dir as a queue root. timeout bounds one job: the request that
 // enqueued it is long gone, so its context cannot carry the deadline.
 func New(dir string, proc Processor, timeout time.Duration, log *slog.Logger) (*Queue, error) {
-	for _, sub := range []string{dirTmp, dirPending, dirActive, dirDone} {
+	for _, sub := range []string{dirTmp, dirPending, dirActive, dirDone, dirFailed} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
 			return nil, fmt.Errorf("prepare queue dir: %w", err)
 		}
@@ -109,7 +150,7 @@ func (q *Queue) Enqueue(filename string, audio io.Reader) (string, error) {
 		return id, nil
 	}
 
-	name := id + filepath.Ext(filename)
+	name := jobName(time.Now(), 0, id, filepath.Ext(filename))
 	if err := os.Rename(spool.Name(), q.path(dirPending, name)); err != nil {
 		return "", fmt.Errorf("enqueue job: %w", err)
 	}
@@ -119,16 +160,15 @@ func (q *Queue) Enqueue(filename string, audio io.Reader) (string, error) {
 // known reports whether id is already queued, in flight or finished. The id is a
 // content hash, so this is what makes a re-uploaded recording a no-op.
 func (q *Queue) known(id string) (bool, error) {
-	for _, sub := range []string{dirPending, dirActive, dirDone} {
-		matches, err := filepath.Glob(q.path(sub, id+".*"))
-		if err != nil {
-			return false, fmt.Errorf("look up job %s: %w", id, err)
-		}
-		if len(matches) > 0 {
-			return true, nil
-		}
+	_, err := q.Lookup(id)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, ErrJobNotFound):
+		return false, nil
+	default:
+		return false, err
 	}
-	return false, nil
 }
 
 // idlePoll is how long a worker waits before looking for work again. A voice
@@ -170,6 +210,40 @@ func (q *Queue) work(ctx context.Context) {
 	}
 }
 
+// Recover clears out jobs left in flight by a crash. It must run before any
+// worker starts, and assumes this process is the only one using the directory.
+func (q *Queue) Recover(ctx context.Context) error {
+	entries, err := os.ReadDir(q.path(dirActive))
+	if err != nil {
+		return fmt.Errorf("read active: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		id := idOf(name)
+		// A recorded result means the work finished and only the cleanup was
+		// lost, so the leftover file is all there is to discard.
+		if _, err := os.Stat(q.path(dirDone, id+".json")); err == nil {
+			q.log.InfoContext(ctx, "discarding a job that finished before the restart", "job_id", id)
+			if err := os.Remove(q.path(dirActive, name)); err != nil {
+				return fmt.Errorf("discard finished job %s: %w", id, err)
+			}
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("recover job %s: %w", id, err)
+		}
+
+		// Otherwise the job died somewhere between transcription and recording
+		// its result, so whether the note reached the sink is unknown. Retrying
+		// could duplicate it; a human decides.
+		q.log.WarnContext(ctx, "job interrupted by a restart, needs review", "job_id", id)
+		if err := q.deadLetter(name, id, "interrupted by a restart; check the sink before retrying"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ProcessNext claims and runs one job. It reports whether a job was claimed.
 func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 	entries, err := os.ReadDir(q.path(dirPending))
@@ -177,8 +251,17 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("read pending: %w", err)
 	}
 
+	now := time.Now()
 	for _, entry := range entries {
 		name := entry.Name()
+		due, attempt, _, err := parseJobName(name)
+		if err != nil {
+			q.log.ErrorContext(ctx, "ignoring malformed job file", "name", name, "error", err)
+			continue
+		}
+		if due.After(now) {
+			continue // still backing off from an earlier attempt
+		}
 		// Winning this rename is what claims the job: a racing worker gets
 		// ENOENT and moves on, so no lock is needed.
 		if err := os.Rename(q.path(dirPending, name), q.path(dirActive, name)); err != nil {
@@ -187,9 +270,47 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 			}
 			return false, fmt.Errorf("claim job: %w", err)
 		}
-		return true, q.run(ctx, name)
+		if err := q.run(ctx, name); err != nil {
+			return true, q.handleFailure(ctx, name, attempt, err)
+		}
+		return true, nil
 	}
 	return false, nil
+}
+
+// handleFailure decides what happens to a job whose attempt failed, and returns the
+// original failure so the caller can log it.
+func (q *Queue) handleFailure(ctx context.Context, name string, attempt int, cause error) error {
+	_, _, id, _ := parseJobName(name)
+	next := attempt + 1
+
+	var sinkErr *memo.SinkError
+	switch {
+	case errors.As(cause, &sinkErr):
+		// The sink may have stored the note before failing, so retrying risks a
+		// duplicate. A human decides this one.
+		return errors.Join(cause, q.deadLetter(name, id, "delivery to "+sinkErr.Sink+" failed and may have partly succeeded: "+cause.Error()))
+	case errors.Is(cause, memo.ErrEmptyTranscript):
+		return errors.Join(cause, q.deadLetter(name, id, cause.Error()))
+	case next >= maxAttempts:
+		return errors.Join(cause, q.deadLetter(name, id, fmt.Sprintf("gave up after %d attempts: %v", next, cause)))
+	}
+
+	retryAt := time.Now().Add(retryDelay(next))
+	q.log.WarnContext(ctx, "job failed, retrying later",
+		"attempt", next, "retry_at", retryAt.Format(time.RFC3339), "error", cause)
+	if err := os.Rename(q.path(dirActive, name), q.path(dirPending, jobName(retryAt, next, id, filepath.Ext(name)))); err != nil {
+		return errors.Join(cause, fmt.Errorf("reschedule job %s: %w", id, err))
+	}
+	return cause
+}
+
+// deadLetter parks a job for a human, recording why it stopped.
+func (q *Queue) deadLetter(name, id, reason string) error {
+	if err := os.Rename(q.path(dirActive, name), q.path(dirFailed, name)); err != nil {
+		return fmt.Errorf("dead letter job %s: %w", id, err)
+	}
+	return os.WriteFile(q.path(dirFailed, id+".reason"), []byte(reason), 0o640)
 }
 
 // run processes a claimed job.
@@ -234,10 +355,14 @@ func (q *Queue) record(id string, result memo.Result) error {
 	return nil
 }
 
-// idOf recovers the job id from a job filename, which is the id plus the audio
-// extension the transcription API needs.
+// idOf recovers the job id from a job filename, ignoring a malformed name: the
+// caller has already read the file, so there is nothing better to report.
 func idOf(name string) string {
-	return strings.TrimSuffix(name, filepath.Ext(name))
+	_, _, id, err := parseJobName(name)
+	if err != nil {
+		return name
+	}
+	return id
 }
 
 func (q *Queue) path(elem ...string) string {
@@ -258,8 +383,14 @@ func (q *Queue) Lookup(id string) (Status, error) {
 		return Status{}, fmt.Errorf("look up job %s: %w", id, err)
 	}
 
+	if reason, err := os.ReadFile(q.path(dirFailed, id+".reason")); err == nil {
+		return Status{ID: id, State: StateFailed, Reason: string(reason)}, nil
+	} else if !os.IsNotExist(err) {
+		return Status{}, fmt.Errorf("look up job %s: %w", id, err)
+	}
+
 	for state, sub := range map[State]string{StateQueued: dirPending, StateProcessing: dirActive} {
-		matches, err := filepath.Glob(q.path(sub, id+".*"))
+		matches, err := filepath.Glob(q.path(sub, "*-"+id+".*"))
 		if err != nil {
 			return Status{}, fmt.Errorf("look up job %s: %w", id, err)
 		}

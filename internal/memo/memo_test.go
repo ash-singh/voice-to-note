@@ -157,3 +157,52 @@ func TestProcessSkipsSinkOnEmptyTranscript(t *testing.T) {
 		t.Error("sink was called for an empty transcript")
 	}
 }
+
+// A background worker has to know whether a failure happened before or after the
+// note was handed to the sink: retrying a delivery that may already have landed
+// creates a second page. Only a sink failure carries that risk.
+func TestProcessDistinguishesSinkFailuresFromEarlierOnes(t *testing.T) {
+	tests := []struct {
+		name       string
+		tr         *fakeTranscriber
+		an         *fakeAnalyzer
+		sk         *fakeSink
+		wantIsSink bool
+	}{
+		{
+			name:       "sink failure",
+			tr:         &fakeTranscriber{text: "call Anna"},
+			an:         &fakeAnalyzer{note: memo.Note{Title: "Invoice"}},
+			sk:         &fakeSink{err: errors.New("notion 502")},
+			wantIsSink: true,
+		},
+		{
+			name: "transcription failure",
+			tr:   &fakeTranscriber{err: errors.New("whisper 429")},
+			an:   &fakeAnalyzer{note: memo.Note{Title: "Invoice"}},
+			sk:   &fakeSink{ref: "page-1"},
+		},
+		{
+			name: "analysis failure",
+			tr:   &fakeTranscriber{text: "call Anna"},
+			an:   &fakeAnalyzer{err: errors.New("chat 429")},
+			sk:   &fakeSink{ref: "page-1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := memo.NewService(tt.tr, tt.an, tt.sk, slog.New(slog.DiscardHandler))
+
+			_, err := svc.Process(context.Background(), "memo.m4a", strings.NewReader("audio"))
+
+			var sinkErr *memo.SinkError
+			if got := errors.As(err, &sinkErr); got != tt.wantIsSink {
+				t.Fatalf("errors.As(SinkError) = %v, want %v (err = %v)", got, tt.wantIsSink, err)
+			}
+			if tt.wantIsSink && sinkErr.Sink != "fake" {
+				t.Errorf("SinkError.Sink = %q, want %q", sinkErr.Sink, "fake")
+			}
+		})
+	}
+}
