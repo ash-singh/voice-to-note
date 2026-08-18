@@ -17,7 +17,7 @@ POST /v1/voicelines (multipart audio)
 
 ## Quick start
 
-Needs Go 1.25+ (developed on 1.26). No database, no other services.
+Needs Go 1.26+ (see the `go` directive in `go.mod`). No database, no other services.
 
 ```bash
 cp .env.example .env          # then edit it, see the table below
