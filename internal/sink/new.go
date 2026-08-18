@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/config"
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/config"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 // sinkTimeout bounds a single delivery attempt to the external tool.

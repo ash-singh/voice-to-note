@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 const (

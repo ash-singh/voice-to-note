@@ -14,12 +14,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/config"
-	"github.com/ashwanisingh/voiceline-challenge/internal/httpapi"
-	"github.com/ashwanisingh/voiceline-challenge/internal/llm"
-	"github.com/ashwanisingh/voiceline-challenge/internal/logging"
-	"github.com/ashwanisingh/voiceline-challenge/internal/sink"
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/config"
+	"github.com/ash-singh/voiceline-challenge/internal/httpapi"
+	"github.com/ash-singh/voiceline-challenge/internal/llm"
+	"github.com/ash-singh/voiceline-challenge/internal/logging"
+	"github.com/ash-singh/voiceline-challenge/internal/sink"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 func main() {

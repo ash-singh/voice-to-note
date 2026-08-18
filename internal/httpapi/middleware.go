@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/logging"
+	"github.com/ash-singh/voiceline-challenge/internal/logging"
 )
 
 const requestIDHeader = "X-Request-Id"

@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/logging"
+	"github.com/ash-singh/voiceline-challenge/internal/logging"
 )
 
 func TestNewEmitsJSONWithRequestIDFromContext(t *testing.T) {

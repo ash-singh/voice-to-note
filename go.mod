@@ -1,4 +1,4 @@
-module github.com/ashwanisingh/voiceline-challenge
+module github.com/ash-singh/voiceline-challenge
 
 go 1.26
 

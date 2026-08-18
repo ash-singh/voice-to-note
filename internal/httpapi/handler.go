@@ -13,7 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 const audioField = "audio"

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 type fakeTranscriber struct {

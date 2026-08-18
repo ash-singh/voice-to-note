@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 const systemPrompt = `You turn a voice memo transcript into a note for a note-taking tool.

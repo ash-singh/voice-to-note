@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/config"
-	"github.com/ashwanisingh/voiceline-challenge/internal/sink"
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/config"
+	"github.com/ash-singh/voiceline-challenge/internal/sink"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 var testNote = voiceline.Note{

@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/ashwanisingh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
 )
 
 // maxErrBody caps how much of an upstream error body we echo into our error.
