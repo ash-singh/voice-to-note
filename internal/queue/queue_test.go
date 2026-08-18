@@ -740,3 +740,104 @@ func TestFailureLogsCarryTheJobID(t *testing.T) {
 		t.Errorf("no log line mentions job %s: %s", id, logs.String())
 	}
 }
+
+// Recovery has to be part of starting the workers. Wired into main instead, it
+// can be deleted without a single test noticing.
+func TestRunRecoversInterruptedJobsBeforeWorkingOnAnything(t *testing.T) {
+	dir := t.TempDir()
+	proc := &fakeProcessor{}
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: proc,
+		Timeout:   time.Minute,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	// Left behind by a crash: in flight, with no recorded result.
+	const id = "cccccccccccccccc"
+	if err := os.WriteFile(filepath.Join(dir, "active", "0000000001-0-"+id+".m4a"), []byte("audio"), 0o640); err != nil {
+		t.Fatalf("seed active job: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		q.Run(ctx, 1)
+		close(stopped)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, err := q.Lookup(id)
+		if err != nil {
+			t.Fatalf("Lookup: %v", err)
+		}
+		if status.State == queue.StateFailed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job state = %s, want %s: Run did not recover it", status.State, queue.StateFailed)
+		}
+	}
+	if got := proc.callCount(); got != 0 {
+		t.Errorf("Process calls = %d, want 0: an interrupted job must not be retried", got)
+	}
+}
+
+// failed/ keeps the audio so a job can be replayed once whatever broke is fixed.
+// The README documents that replay as moving the file back into pending, so the
+// stale reason file must not survive it.
+func TestReplayingADeadLetteredJobClearsItsReason(t *testing.T) {
+	dir := t.TempDir()
+	proc := &fakeProcessor{err: &memo.SinkError{Sink: "notion", Err: errors.New("502")}}
+	q, err := queue.New(queue.Options{
+		Dir:       dir,
+		Processor: proc,
+		Timeout:   time.Minute,
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("queue.New: %v", err)
+	}
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := q.ProcessNext(context.Background()); err == nil {
+		t.Fatal("ProcessNext hid the delivery failure")
+	}
+
+	// The operator fixes the sink and replays the job.
+	parked, err := filepath.Glob(filepath.Join(dir, "failed", "*-"+id+".*"))
+	if err != nil || len(parked) != 1 {
+		t.Fatalf("want one parked job file, got %v (err %v)", parked, err)
+	}
+	if err := os.Rename(parked[0], filepath.Join(dir, "pending", filepath.Base(parked[0]))); err != nil {
+		t.Fatalf("replay job: %v", err)
+	}
+	proc.err = nil
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext after replay: %v", err)
+	}
+
+	status, err := q.Lookup(id)
+	if err != nil {
+		t.Fatalf("Lookup after replay: %v", err)
+	}
+	if status.State != queue.StateDone {
+		t.Errorf("state = %s, want %s", status.State, queue.StateDone)
+	}
+	if status.Reason != "" {
+		t.Errorf("reason = %q, want it cleared by the successful replay", status.Reason)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failed", id+".reason")); !os.IsNotExist(err) {
+		t.Errorf("stale reason file survived the replay (stat err = %v)", err)
+	}
+}

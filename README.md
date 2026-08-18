@@ -142,7 +142,10 @@ Coverage: 100% of the domain package, ~90% of the HTTP layer, ~79% of the queue,
 The queue tests use `t.TempDir()` and a fake processor, and drive one job at a
 time through an exported `ProcessNext` rather than waiting on the worker loop, so
 nothing sleeps and nothing touches the network. Concurrent claiming is covered
-under `-race`.
+under `-race`. Two of them — partial uploads staying invisible, and the extension
+surviving the rename to a job id — assert invariants the design already had, so
+each was validated by mutating the implementation and watching it fail rather
+than by trusting a test that passed first time.
 
 ## Design notes / scope
 
@@ -182,7 +185,9 @@ under `-race`.
   the note before failing, so it is dead lettered instead of retried, and so is a
   job interrupted by a restart with no recorded result. Preferring a visible
   `failed` over a possible duplicate is the deliberate choice; `failed/` keeps
-  the audio and a `.reason` file, so replaying one is `mv`.
+  the audio and a `.reason` file, so replaying a job once the cause is fixed is
+  `mv queue/failed/<file>.m4a queue/pending/` — claiming it clears the stale
+  reason.
 * **Backpressure** — `QUEUE_MAX_DEPTH` is checked *before* the upload is
   spooled, so a flood is refused without being written to disk, and it doubles as
   the disk ceiling. A full queue answers `429` with `Retry-After` rather than a

@@ -60,12 +60,6 @@ func run() error {
 	}
 	handler := httpapi.NewNoteHandler(jobs, cfg.MaxAudioBytes, log)
 
-	// Before any worker starts, so a crashed run's in-flight jobs are resolved
-	// rather than raced over.
-	if err := jobs.Recover(context.Background()); err != nil {
-		return err
-	}
-
 	gin.SetMode(gin.ReleaseMode)
 	srv := &http.Server{
 		Addr:              cfg.Addr,

@@ -213,9 +213,14 @@ func (q *Queue) known(id string) (bool, error) {
 // memo is not latency sensitive, so polling beats a filesystem watcher.
 const idlePoll = time.Second
 
-// Run drives workers until ctx is cancelled, then returns once they have all
-// finished the job in hand.
+// Run resolves whatever a previous process left in flight, then drives workers
+// until ctx is cancelled, returning once they have all finished the job in hand.
+// Recovery happens here rather than at the call site so it cannot be forgotten.
 func (q *Queue) Run(ctx context.Context, workers int) {
+	if err := q.Recover(ctx); err != nil {
+		q.opts.Logger.ErrorContext(ctx, "could not recover jobs left by a restart", "error", err)
+	}
+
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Add(1)
@@ -308,6 +313,12 @@ func (q *Queue) ProcessNext(ctx context.Context) (bool, error) {
 			}
 			return false, fmt.Errorf("claim job: %w", err)
 		}
+		// A job moved back out of failed/ by hand is being replayed, so the reason
+		// it stopped last time no longer applies.
+		if err := os.Remove(q.path(dirFailed, idOf(name)+".reason")); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("clear stale reason for job %s: %w", idOf(name), err)
+		}
+
 		// Tagged here rather than inside run, so the failure paths log the job
 		// id too: the submitting request is long gone by now.
 		jobCtx := logging.WithRequestID(ctx, "job-"+idOf(name))
@@ -412,33 +423,63 @@ func (q *Queue) path(elem ...string) string {
 }
 
 // Lookup reports the state of a job, and its result once it has one.
+//
+// A job moves between directories while this runs — a worker claims it, a retry
+// puts it back — and each directory is a separate syscall, so a single sweep can
+// miss a job that moves across the scan. Sweeping twice before reporting it
+// missing costs a handful of stats and means a job would have to move twice, in
+// the window between two passes, to disappear.
 func (q *Queue) Lookup(id string) (Status, error) {
+	for range 2 {
+		status, found, err := q.locate(id)
+		if err != nil {
+			return Status{}, err
+		}
+		if found {
+			return status, nil
+		}
+	}
+	return Status{}, fmt.Errorf("%s: %w", id, ErrJobNotFound)
+}
+
+// locate looks for a job in one sweep of the queue directories.
+func (q *Queue) locate(id string) (Status, bool, error) {
 	body, err := os.ReadFile(q.path(dirDone, id+".json"))
 	switch {
 	case err == nil:
 		var result memo.Result
 		if err := json.Unmarshal(body, &result); err != nil {
-			return Status{}, fmt.Errorf("decode result of job %s: %w", id, err)
+			return Status{}, false, fmt.Errorf("decode result of job %s: %w", id, err)
 		}
-		return Status{ID: id, State: StateDone, Result: &result}, nil
+		return Status{ID: id, State: StateDone, Result: &result}, true, nil
 	case !os.IsNotExist(err):
-		return Status{}, fmt.Errorf("look up job %s: %w", id, err)
+		return Status{}, false, fmt.Errorf("look up job %s: %w", id, err)
 	}
 
-	if reason, err := os.ReadFile(q.path(dirFailed, id+".reason")); err == nil {
-		return Status{ID: id, State: StateFailed, Reason: string(reason)}, nil
-	} else if !os.IsNotExist(err) {
-		return Status{}, fmt.Errorf("look up job %s: %w", id, err)
-	}
-
-	for state, sub := range map[State]string{StateQueued: dirPending, StateProcessing: dirActive} {
-		matches, err := filepath.Glob(q.path(sub, "*-"+id+".*"))
+	// Keyed on the job file rather than its reason file: the rename into failed is
+	// the state transition, and the reason is written just after it.
+	for _, dir := range []struct {
+		state State
+		sub   string
+	}{
+		{StateFailed, dirFailed},
+		{StateProcessing, dirActive},
+		{StateQueued, dirPending},
+	} {
+		matches, err := filepath.Glob(q.path(dir.sub, "*-"+id+".*"))
 		if err != nil {
-			return Status{}, fmt.Errorf("look up job %s: %w", id, err)
+			return Status{}, false, fmt.Errorf("look up job %s: %w", id, err)
 		}
-		if len(matches) > 0 {
-			return Status{ID: id, State: state}, nil
+		if len(matches) == 0 {
+			continue
 		}
+		status := Status{ID: id, State: dir.state}
+		if dir.state == StateFailed {
+			if reason, err := os.ReadFile(q.path(dirFailed, id+".reason")); err == nil {
+				status.Reason = string(reason)
+			}
+		}
+		return status, true, nil
 	}
-	return Status{}, fmt.Errorf("%s: %w", id, ErrJobNotFound)
+	return Status{}, false, nil
 }
