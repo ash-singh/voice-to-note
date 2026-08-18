@@ -44,19 +44,27 @@ curl http://localhost:8080/v1/notes/4730a7a45987cf68
 ```json
 {
   "data": {
-    "note": {
-      "title": "Invoice follow-up with Anna",
-      "summary": "Anna has an unpaid invoice. Call her tomorrow and send the new offer.",
-      "action_items": ["Call Anna tomorrow", "Send Anna the new offer"],
-      "transcript": "Call Anna tomorrow about the unpaid invoice and send her the new offer."
-    },
-    "sink": "webhook",
-    "sink_ref": "row-1"
+    "id": "4730a7a45987cf68",
+    "state": "done",
+    "result": {
+      "note": {
+        "title": "Call Anna about Invoice and Offer",
+        "summary": "Discuss the unpaid invoice with Anna and send her the new offer.",
+        "action_items": ["Call Anna about the unpaid invoice", "Send Anna the new offer"],
+        "transcript": "Call Anna tomorrow about the unpaid invoice and send her the new offer."
+      },
+      "sink": "webhook",
+      "sink_ref": "https://webhook.site/<your-uuid>"
+    }
   }
 }
 ```
 
-`testdata/memo.m4a` is the recording above. Record your own on macOS:
+Poll until `state` is `done`; before that you get `queued` or `processing`, and a
+`failed` job carries a `reason` instead of a `result`.
+
+`testdata/memo.m4a` is the recording above, and that `job_id` is what you will
+get for it — the id is a hash of the audio. Record your own on macOS:
 `say -o memo.aiff "..." && afconvert -f mp4f -d aac memo.aiff memo.m4a`
 
 ## API
@@ -104,15 +112,44 @@ that id appears on every log line for the request.
 
 ### Notion sink
 
-Create an internal integration, share a page with it, and pass that page id as
-`NOTION_PARENT_PAGE_ID`. Each memo becomes a page: title, summary paragraph,
-action items as to-do blocks, transcript at the bottom. A *page* parent (rather
-than a database) keeps the payload free of database-schema coupling.
+Create an internal integration, then open the parent page in Notion and use
+`•••` → **Connections** → **Connect to** to give the integration access — without
+that grant the API returns `404` for the page, which reads exactly like a wrong
+id. `NOTION_PARENT_PAGE_ID` is the bare 32-hex id at the end of the page URL,
+without the title slug.
+
+Each memo becomes a page: title, summary paragraph, action items as to-do blocks,
+transcript at the bottom. A *page* parent (rather than a database) keeps the
+payload free of database-schema coupling.
+
+### Queue on disk
+
+`QUEUE_DIR` is inspectable with `ls`, which is most of its appeal:
+
+```
+queue/
+  tmp/       partial uploads; never seen by a worker
+  pending/   <due>-<attempt>-<id>.m4a   waiting, oldest due first
+  active/    claimed by a worker
+  done/      <id>.json                 the Result, served by GET /v1/notes/{id}
+  failed/    the audio + <id>.reason    dead letters, for a human
+```
+
+To replay a dead letter once the cause is fixed:
+
+```bash
+mv queue/failed/1787062647-0-c7b3317585c25805.m4a queue/pending/
+```
+
+Claiming it clears the stale `.reason`. `done/` is never swept automatically; a
+long-running deployment wants a cron job for that.
 
 ## Logging
 
 `log/slog` JSON on stdout, one access log line per request (method, path,
-status, duration, size, client ip, request id) plus domain events. Nothing else
+status, duration, size, client ip, request id) plus domain events. Worker lines
+carry `request_id: "job-<id>"` instead: the request that submitted the job has
+returned long before the work runs, so the job id is what correlates them. Nothing else
 writes to stdout: the server uses `gin.New()` rather than `gin.Default()`, and
 panics are recovered into a structured `error` line with the stack as a field.
 

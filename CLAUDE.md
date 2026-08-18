@@ -30,8 +30,10 @@ with a job id; a worker then runs the pipeline: transcribe → extract a structu
 note via an LLM → submit that note to an external tool. `GET /v1/notes/{id}`
 reports the job (and the note once done), `GET /healthz` is the probe.
 
-`internal/memo` is the core: it owns `Service.Process` and **defines** the
-`Transcriber`, `Analyzer` and `Sink` interfaces it needs. Everything else is an
+`internal/memo` is the core: it owns `Service.Process`, **defines** the
+`Transcriber`, `Analyzer` and `Sink` interfaces it needs, and owns `SinkError`,
+which is what lets a worker tell a failure that cannot have delivered from one
+that might have. Everything else is an
 adapter that satisfies them, so the dependency arrows point inward:
 
 - `internal/llm` — one `Client` implements both `Transcriber` (multipart POST to
@@ -42,8 +44,9 @@ adapter that satisfies them, so the dependency arrows point inward:
 - `internal/sink` — `Webhook` (JSON POST anywhere) and `Notion` (a page per memo
   under a *page* parent, so no database schema coupling). `sink.New(cfg)` picks
   one from config.
-- `internal/httpapi` — Gin layer. Depends on the narrow `Processor` interface,
-  not on `*memo.Service`.
+- `internal/httpapi` — Gin layer. Accepts and looks up work through the narrow
+  `Jobs` interface, never `*queue.Queue`, and never touches `memo.Service`: the
+  handler validates the upload and hands it over, nothing more.
 - `internal/queue` — the durable job queue, and the reason the API is
   asynchronous. A directory per state (`tmp`, `pending`, `active`, `done`,
   `failed`); `os.Rename` provides both atomic publish and worker-exclusive
@@ -56,16 +59,22 @@ adapter that satisfies them, so the dependency arrows point inward:
 
 When adding a step or a delivery target, add the interface method or
 implementation in the domain/adapter package; do not let `httpapi` or
-`cmd/server` grow business logic. `httpapi` depends on the narrow `Jobs`
-interface (enqueue + look up), never on `*queue.Queue`. `cmd/server/main.go` is wiring only and is
-deliberately not unit tested.
+`cmd/server` grow business logic. `cmd/server/main.go` is wiring only and is
+deliberately not unit tested — which is why anything with behaviour belongs in a
+package instead: `Recover` used to be called from `main`, and deleting that call
+broke no test at all.
 
 ### Conventions that are load-bearing
 
-- **The queue is single-instance.** `Recover` resolves everything left in
-  `active/` at boot, which would steal another process's in-flight jobs if two
-  servers shared a `QUEUE_DIR`. Scope `active/` per instance before running more
-  than one.
+- **The queue is single-instance.** `Queue.Run` calls `Recover` before starting
+  workers, and it resolves everything in `active/` — which would steal another
+  process's in-flight jobs if two servers shared a `QUEUE_DIR`. Scope `active/`
+  per instance before running more than one.
+- **`Lookup` sweeps the directories twice.** A job moves between them while it
+  runs (a worker claims it, a retry puts it back) and each directory is a
+  separate syscall, so one sweep can miss a job that moves across it and report
+  a 404 for live work. Job state follows the job *file*, never the `.reason`
+  sidecar, which is written just after the rename.
 - **Tests run offline with zero env vars.** Domain tests use fakes; HTTP tests
   use `httptest` recorders; client tests use `httptest.Server` via the
   injectable base URL. Never make a test read a real key or reach the network,
@@ -75,15 +84,39 @@ deliberately not unit tested.
   `...Context` methods (`InfoContext`, `ErrorContext`) and thread `ctx` through.
   The router uses `gin.New()`, never `gin.Default()` — Gin's own logger would
   duplicate the structured access log written by `httpapi.RequestLogger`.
-- **HTTP status mapping** lives in `httpapi.NoteHandler.Create`: 400
-  missing/invalid form, 413 over `MAX_AUDIO_BYTES`, 415 extension not in
-  `allowedAudioExt`, 422 `memo.ErrEmptyTranscript`, 502 any other pipeline
-  error. Errors use `{"error": "..."}`, success uses `{"data": ...}`.
+- **HTTP status mapping** lives in `httpapi.NoteHandler.Create`: 202 accepted,
+  400 missing/invalid form, 413 over `MAX_AUDIO_BYTES`, 415 extension not in
+  `allowedAudioExt`, 429 `queue.ErrQueueFull` (with `Retry-After`). `Show` adds
+  404 for `queue.ErrJobNotFound`. Errors use `{"error": "..."}`, success uses
+  `{"data": ...}`. Note what is *absent*: an unusable recording or a failed
+  delivery happens after the response, so it surfaces as `state: "failed"` on
+  the job, not as a 4xx/5xx. Do not reintroduce 422/502 on `Create`.
 - Upstream failures wrap the cause (`fmt.Errorf("transcribe: %w", err)`) and
-  error bodies from third parties are echoed only up to `maxErrBody` bytes.
+  error bodies from third parties are echoed only up to `maxErrBody` bytes. The
+  sink step is the exception and returns a typed `*memo.SinkError` instead, on
+  purpose: the queue routes on it with `errors.As`, so replacing it with a
+  formatted string would silently turn dead lettering back into blind retries.
 
 ## Scope
 
-This is a time-boxed coding challenge (README documents the deliberate
-omissions: no auth, retries, queue, rate limiting, Docker). Prefer keeping it
-that way over adding infrastructure.
+This is a time-boxed coding challenge. It has a durable queue, retries with
+backoff, dead lettering and a backlog cap; it deliberately has no auth, no
+per-client rate limiting, no database and no Docker, and retries do not honour
+upstream `Retry-After`. README's "Design notes / scope" is the current list.
+Prefer keeping it that way over adding infrastructure.
+
+# Response Style
+
+Use ASD-STE100 Simplified Technical English.
+
+For all responses:
+- Be concise.
+- Use short sentences.
+- Use simple and precise words.
+- Avoid filler and repetition.
+- Avoid long introductions and conclusions.
+- State the result first.
+- Explain only what is necessary.
+- Prefer bullet points for multiple items.
+- Keep technical terms when they are standard in software engineering.
+- Do not simplify code, API names, framework names, or established technical terminology.
