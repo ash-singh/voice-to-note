@@ -12,6 +12,7 @@ make fmt vet tidy
 
 go test ./internal/httpapi/                                   # one package
 go test ./internal/sink/ -run TestNotionSaveCreatesPageUnderParent -v   # one test
+go test -race ./internal/queue/                                # concurrent claiming
 ```
 
 CI (`.github/workflows/ci.yml`) runs `gofmt -l .` (fails on any unformatted
@@ -24,9 +25,10 @@ fails fast with a joined error listing every missing variable. See
 
 ## Architecture
 
-One synchronous pipeline behind `POST /v1/notes` (multipart field `audio`):
-transcribe → extract a structured note via an LLM → submit that note to an
-external tool. `GET /healthz` is the probe.
+`POST /v1/notes` (multipart field `audio`) spools the upload and returns `202`
+with a job id; a worker then runs the pipeline: transcribe → extract a structured
+note via an LLM → submit that note to an external tool. `GET /v1/notes/{id}`
+reports the job (and the note once done), `GET /healthz` is the probe.
 
 `internal/memo` is the core: it owns `Service.Process` and **defines** the
 `Transcriber`, `Analyzer` and `Sink` interfaces it needs. Everything else is an
@@ -42,15 +44,28 @@ adapter that satisfies them, so the dependency arrows point inward:
   one from config.
 - `internal/httpapi` — Gin layer. Depends on the narrow `Processor` interface,
   not on `*memo.Service`.
+- `internal/queue` — the durable job queue, and the reason the API is
+  asynchronous. A directory per state (`tmp`, `pending`, `active`, `done`,
+  `failed`); `os.Rename` provides both atomic publish and worker-exclusive
+  claiming, so there is no lock anywhere. Job files are
+  `<due>-<attempt>-<id><ext>`, the id being a content hash — which is what makes
+  a re-upload idempotent. Retry policy hinges on `memo.SinkError`: only failures
+  that cannot have reached the sink are retried; anything that might have
+  delivered is dead lettered for review.
 - `internal/config` — env → `Config`, validated in `Load`.
 
 When adding a step or a delivery target, add the interface method or
 implementation in the domain/adapter package; do not let `httpapi` or
-`cmd/server` grow business logic. `cmd/server/main.go` is wiring only and is
+`cmd/server` grow business logic. `httpapi` depends on the narrow `Jobs`
+interface (enqueue + look up), never on `*queue.Queue`. `cmd/server/main.go` is wiring only and is
 deliberately not unit tested.
 
 ### Conventions that are load-bearing
 
+- **The queue is single-instance.** `Recover` resolves everything left in
+  `active/` at boot, which would steal another process's in-flight jobs if two
+  servers shared a `QUEUE_DIR`. Scope `active/` per instance before running more
+  than one.
 - **Tests run offline with zero env vars.** Domain tests use fakes; HTTP tests
   use `httptest` recorders; client tests use `httptest.Server` via the
   injectable base URL. Never make a test read a real key or reach the network,
