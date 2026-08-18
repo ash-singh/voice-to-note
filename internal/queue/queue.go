@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ash-singh/voice-to-note/internal/logging"
 	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
@@ -199,6 +200,9 @@ func (q *Queue) run(ctx context.Context, name string) error {
 	}
 	defer file.Close()
 
+	// The submitting request is gone, so the job id becomes the correlation id
+	// every log record from this job carries.
+	ctx = logging.WithRequestID(ctx, "job-"+idOf(name))
 	ctx, cancel := context.WithTimeout(ctx, q.timeout)
 	defer cancel()
 

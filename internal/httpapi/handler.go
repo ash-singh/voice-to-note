@@ -82,8 +82,16 @@ func (h *NoteHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// The id is a content hash, so this upload may be a duplicate of one that has
+	// already been processed. Report where the job really is, not where a fresh
+	// one would be.
+	state := queue.StateQueued
+	if status, err := h.queue.Lookup(id); err == nil {
+		state = status.State
+	}
+
 	c.Header("Location", "/v1/notes/"+id)
-	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"job_id": id, "state": "queued"}})
+	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"job_id": id, "state": state}})
 }
 
 // Show reports what has become of a queued voice memo.

@@ -68,7 +68,7 @@ func TestCreateNoteRejectsBadRequests(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			router, _ := newServer(t, &fakeQueue{enqueueErr: tt.enqueueErr}, tt.maxBytes)
+			router, _ := newServer(t, &fakeQueue{enqueueErr: tt.enqueueErr, status: queue.Status{State: queue.StateQueued}}, tt.maxBytes)
 			body, contentType := audioBody(t, tt.field, tt.filename, tt.content)
 			req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
 			req.Header.Set("Content-Type", contentType)
@@ -144,7 +144,7 @@ func (f *fakeQueue) Enqueue(filename string, audio io.Reader) (string, error) {
 // The point of the queue: the request is acknowledged without waiting for the
 // LLM, and the caller gets an id to follow up with.
 func TestCreateNoteAcceptsTheUploadAndReturnsAJobID(t *testing.T) {
-	q := &fakeQueue{id: "abc123"}
+	q := &fakeQueue{id: "abc123", status: queue.Status{ID: "abc123", State: queue.StateQueued}}
 	router, _ := newServer(t, q, 1<<20)
 	body, contentType := audioBody(t, "audio", "memo.m4a", "fake-audio")
 	req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
@@ -291,4 +291,34 @@ func (r *recordingProcessor) Process(_ context.Context, filename string, audio i
 	}
 	r.gotName, r.gotAudio = filename, string(b)
 	return r.result, nil
+}
+
+// Re-uploading a recording that has already been processed must not claim the
+// work is queued: the caller would poll for a transition that never comes.
+func TestCreateNoteReportsTheRealStateOfADeduplicatedJob(t *testing.T) {
+	result := memo.Result{Note: memo.Note{Title: "Invoice"}, Sink: "notion", SinkRef: "https://notion.so/page"}
+	q := &fakeQueue{id: "abc123", status: queue.Status{ID: "abc123", State: queue.StateDone, Result: &result}}
+	router, _ := newServer(t, q, 1<<20)
+	body, contentType := audioBody(t, "audio", "memo.m4a", "fake-audio")
+	req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (body %s)", rec.Code, rec.Body)
+	}
+	var got struct {
+		Data struct {
+			JobID string `json:"job_id"`
+			State string `json:"state"`
+		}
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if got.Data.State != string(queue.StateDone) {
+		t.Errorf("state = %q, want %q", got.Data.State, queue.StateDone)
+	}
 }

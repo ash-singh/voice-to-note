@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ash-singh/voice-to-note/internal/logging"
 	"github.com/ash-singh/voice-to-note/internal/memo"
 	"github.com/ash-singh/voice-to-note/internal/queue"
 )
@@ -483,5 +484,36 @@ func TestProcessNextBoundsAJobByTheProcessTimeout(t *testing.T) {
 	}
 	if proc.within <= 0 || proc.within > 90*time.Second {
 		t.Errorf("deadline is %v away, want it within the 90s timeout", proc.within)
+	}
+}
+
+// taggingProcessor captures the correlation id the queue put on the job context.
+type taggingProcessor struct {
+	fakeProcessor
+	requestID string
+}
+
+func (p *taggingProcessor) Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error) {
+	p.requestID = logging.RequestIDFrom(ctx)
+	return p.fakeProcessor.Process(ctx, filename, audio)
+}
+
+// The request that enqueued the job is gone, so its request id cannot correlate
+// the worker's log lines. The job id has to take over, or "voice memo stored"
+// lands in the log with nothing tying it to anything.
+func TestProcessNextCorrelatesLogsWithTheJobID(t *testing.T) {
+	proc := &taggingProcessor{}
+	q := newTestQueue(t, proc)
+	id, err := q.Enqueue("memo.m4a", strings.NewReader("audio bytes"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if _, err := q.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("ProcessNext: %v", err)
+	}
+
+	if !strings.Contains(proc.requestID, id) {
+		t.Errorf("job context request id = %q, want it to contain the job id %q", proc.requestID, id)
 	}
 }
