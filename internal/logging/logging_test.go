@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/ash-singh/voiceline-challenge/internal/logging"
+	"github.com/ash-singh/voice-to-note/internal/logging"
 )
 
 func TestNewEmitsJSONWithRequestIDFromContext(t *testing.T) {
 	var buf bytes.Buffer
-	log := logging.New("debug", &buf).With("service", "voiceline")
+	log := logging.New("debug", &buf).With("service", "voice-to-note")
 	ctx := logging.WithRequestID(context.Background(), "req-42")
 
 	log.InfoContext(ctx, "stored", "sink", "webhook")
@@ -21,7 +21,7 @@ func TestNewEmitsJSONWithRequestIDFromContext(t *testing.T) {
 		t.Fatalf("log line is not JSON: %v (%s)", err, buf.String())
 	}
 	for k, want := range map[string]any{
-		"msg": "stored", "sink": "webhook", "request_id": "req-42", "service": "voiceline",
+		"msg": "stored", "sink": "webhook", "request_id": "req-42", "service": "voice-to-note",
 	} {
 		if got[k] != want {
 			t.Errorf("log[%q] = %v, want %v", k, got[k], want)

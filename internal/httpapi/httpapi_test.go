@@ -15,9 +15,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ash-singh/voiceline-challenge/internal/httpapi"
-	"github.com/ash-singh/voiceline-challenge/internal/logging"
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/httpapi"
+	"github.com/ash-singh/voice-to-note/internal/logging"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 func TestMain(m *testing.M) {
@@ -26,13 +26,13 @@ func TestMain(m *testing.M) {
 }
 
 type fakeProcessor struct {
-	result   voiceline.Result
+	result   memo.Result
 	err      error
 	gotName  string
 	gotAudio string
 }
 
-func (f *fakeProcessor) Process(_ context.Context, filename string, audio io.Reader) (voiceline.Result, error) {
+func (f *fakeProcessor) Process(_ context.Context, filename string, audio io.Reader) (memo.Result, error) {
 	b, _ := io.ReadAll(audio)
 	f.gotName, f.gotAudio = filename, string(b)
 	return f.result, f.err
@@ -59,19 +59,19 @@ func newServer(t *testing.T, p httpapi.Processor, maxBytes int64) (*gin.Engine, 
 	t.Helper()
 	var logs bytes.Buffer
 	log := logging.New("debug", &logs)
-	return httpapi.NewRouter(httpapi.NewVoicelineHandler(p, maxBytes, time.Second, log), log), &logs
+	return httpapi.NewRouter(httpapi.NewNoteHandler(p, maxBytes, time.Second, log), log), &logs
 }
 
-func TestCreateVoicelineReturnsStoredNote(t *testing.T) {
+func TestCreateNoteReturnsStoredNote(t *testing.T) {
 	// Arrange
-	proc := &fakeProcessor{result: voiceline.Result{
-		Note:    voiceline.Note{Title: "Invoice", Summary: "Call Anna", ActionItems: []string{"Call Anna"}},
+	proc := &fakeProcessor{result: memo.Result{
+		Note:    memo.Note{Title: "Invoice", Summary: "Call Anna", ActionItems: []string{"Call Anna"}},
 		Sink:    "webhook",
 		SinkRef: "https://sink.example/1",
 	}}
 	router, logs := newServer(t, proc, 1<<20)
 	body, contentType := audioBody(t, "audio", "memo.m4a", "fake-audio")
-	req := httptest.NewRequest(http.MethodPost, "/v1/voicelines", body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
 	req.Header.Set("Content-Type", contentType)
 	rec := httptest.NewRecorder()
 
@@ -82,7 +82,7 @@ func TestCreateVoicelineReturnsStoredNote(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body)
 	}
-	var got struct{ Data voiceline.Result }
+	var got struct{ Data memo.Result }
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("response is not JSON: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestCreateVoicelineReturnsStoredNote(t *testing.T) {
 	}
 }
 
-func TestCreateVoicelineRejectsBadRequests(t *testing.T) {
+func TestCreateNoteRejectsBadRequests(t *testing.T) {
 	tests := []struct {
 		name       string
 		field      string
@@ -113,7 +113,7 @@ func TestCreateVoicelineRejectsBadRequests(t *testing.T) {
 		{name: "missing audio field", field: "file", filename: "memo.m4a", content: "x", maxBytes: 1 << 20, wantStatus: http.StatusBadRequest},
 		{name: "unsupported format", field: "audio", filename: "memo.txt", content: "x", maxBytes: 1 << 20, wantStatus: http.StatusUnsupportedMediaType},
 		{name: "audio too large", field: "audio", filename: "memo.m4a", content: strings.Repeat("x", 2048), maxBytes: 512, wantStatus: http.StatusRequestEntityTooLarge},
-		{name: "silent audio", field: "audio", filename: "memo.m4a", content: "x", maxBytes: 1 << 20, procErr: voiceline.ErrEmptyTranscript, wantStatus: http.StatusUnprocessableEntity},
+		{name: "silent audio", field: "audio", filename: "memo.m4a", content: "x", maxBytes: 1 << 20, procErr: memo.ErrEmptyTranscript, wantStatus: http.StatusUnprocessableEntity},
 		{name: "upstream failure", field: "audio", filename: "memo.m4a", content: "x", maxBytes: 1 << 20, procErr: errors.New("llm down"), wantStatus: http.StatusBadGateway},
 	}
 
@@ -121,7 +121,7 @@ func TestCreateVoicelineRejectsBadRequests(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			router, _ := newServer(t, &fakeProcessor{err: tt.procErr}, tt.maxBytes)
 			body, contentType := audioBody(t, tt.field, tt.filename, tt.content)
-			req := httptest.NewRequest(http.MethodPost, "/v1/voicelines", body)
+			req := httptest.NewRequest(http.MethodPost, "/v1/notes", body)
 			req.Header.Set("Content-Type", contentType)
 			rec := httptest.NewRecorder()
 

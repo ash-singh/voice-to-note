@@ -1,4 +1,4 @@
-// Package httpapi exposes the voice line flow over HTTP with Gin.
+// Package httpapi exposes the voice memo flow over HTTP with Gin.
 package httpapi
 
 import (
@@ -13,7 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 const audioField = "audio"
@@ -26,24 +26,24 @@ var allowedAudioExt = map[string]bool{
 
 // Processor is the domain entry point the handler depends on.
 type Processor interface {
-	Process(ctx context.Context, filename string, audio io.Reader) (voiceline.Result, error)
+	Process(ctx context.Context, filename string, audio io.Reader) (memo.Result, error)
 }
 
-// VoicelineHandler serves POST /v1/voicelines.
-type VoicelineHandler struct {
+// NoteHandler serves POST /v1/notes.
+type NoteHandler struct {
 	svc           Processor
 	maxAudioBytes int64
 	timeout       time.Duration
 	log           *slog.Logger
 }
 
-func NewVoicelineHandler(svc Processor, maxAudioBytes int64, timeout time.Duration, log *slog.Logger) *VoicelineHandler {
-	return &VoicelineHandler{svc: svc, maxAudioBytes: maxAudioBytes, timeout: timeout, log: log}
+func NewNoteHandler(svc Processor, maxAudioBytes int64, timeout time.Duration, log *slog.Logger) *NoteHandler {
+	return &NoteHandler{svc: svc, maxAudioBytes: maxAudioBytes, timeout: timeout, log: log}
 }
 
 // Create accepts a multipart upload with an "audio" file part, has it
 // transcribed and summarised, and stores the note in the configured sink.
-func (h *VoicelineHandler) Create(c *gin.Context) {
+func (h *NoteHandler) Create(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxAudioBytes)
 
 	fileHeader, err := c.FormFile(audioField)
@@ -80,12 +80,12 @@ func (h *VoicelineHandler) Create(c *gin.Context) {
 
 	result, err := h.svc.Process(ctx, filename, file)
 	switch {
-	case errors.Is(err, voiceline.ErrEmptyTranscript):
+	case errors.Is(err, memo.ErrEmptyTranscript):
 		respondError(c, http.StatusUnprocessableEntity, "no speech detected in the audio")
 		return
 	case err != nil:
 		_ = c.Error(err)
-		respondError(c, http.StatusBadGateway, "could not process the voice line")
+		respondError(c, http.StatusBadGateway, "could not process the voice memo")
 		return
 	}
 

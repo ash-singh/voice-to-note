@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 const systemPrompt = `You turn a voice memo transcript into a note for a note-taking tool.
@@ -104,7 +104,7 @@ func writeAudioForm(mw *multipart.Writer, filename string, audio io.Reader, mode
 }
 
 // Analyze asks the chat model for a structured note built from the transcript.
-func (c *Client) Analyze(ctx context.Context, transcript string) (voiceline.Note, error) {
+func (c *Client) Analyze(ctx context.Context, transcript string) (memo.Note, error) {
 	payload := map[string]any{
 		"model": c.chatModel,
 		"messages": []map[string]string{
@@ -115,12 +115,12 @@ func (c *Client) Analyze(ctx context.Context, transcript string) (voiceline.Note
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return voiceline.Note{}, err
+		return memo.Note{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return voiceline.Note{}, err
+		return memo.Note{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -132,15 +132,15 @@ func (c *Client) Analyze(ctx context.Context, transcript string) (voiceline.Note
 		} `json:"choices"`
 	}
 	if err := c.do(req, &out); err != nil {
-		return voiceline.Note{}, err
+		return memo.Note{}, err
 	}
 	if len(out.Choices) == 0 {
-		return voiceline.Note{}, fmt.Errorf("chat completion returned no choices")
+		return memo.Note{}, fmt.Errorf("chat completion returned no choices")
 	}
 
-	var note voiceline.Note
+	var note memo.Note
 	if err := json.Unmarshal([]byte(out.Choices[0].Message.Content), &note); err != nil {
-		return voiceline.Note{}, fmt.Errorf("model did not return valid JSON: %w", err)
+		return memo.Note{}, fmt.Errorf("model did not return valid JSON: %w", err)
 	}
 	return note, nil
 }

@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 const (
@@ -18,7 +18,7 @@ const (
 	notionTextLimit = 2000
 )
 
-// Notion creates one page per voice line under a parent page. A page parent (as
+// Notion creates one page per voice memo under a parent page. A page parent (as
 // opposed to a database) keeps the payload free of database schema coupling.
 type Notion struct {
 	httpClient   *http.Client
@@ -44,7 +44,7 @@ func NewNotion(baseURL, token, parentPageID string, httpClient *http.Client) *No
 func (n *Notion) Name() string { return "notion" }
 
 // Save creates the Notion page and returns its URL.
-func (n *Notion) Save(ctx context.Context, note voiceline.Note) (string, error) {
+func (n *Notion) Save(ctx context.Context, note memo.Note) (string, error) {
 	body, err := json.Marshal(map[string]any{
 		"parent": map[string]string{"page_id": n.parentPageID},
 		"properties": map[string]any{
@@ -83,7 +83,7 @@ func (n *Notion) Save(ctx context.Context, note voiceline.Note) (string, error) 
 	return out.URL, nil
 }
 
-func notionChildren(note voiceline.Note) []map[string]any {
+func notionChildren(note memo.Note) []map[string]any {
 	children := []map[string]any{paragraph(note.Summary)}
 	for _, item := range note.ActionItems {
 		children = append(children, map[string]any{

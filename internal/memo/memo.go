@@ -1,6 +1,6 @@
-// Package voiceline holds the domain flow: audio in, structured note out, note
+// Package memo holds the domain flow: audio in, structured note out, note
 // pushed to an external system.
-package voiceline
+package memo
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-// Note is the structured result the LLM extracts from a spoken voice line.
+// Note is the structured result the LLM extracts from a spoken voice memo.
 type Note struct {
 	Title       string   `json:"title"`
 	Summary     string   `json:"summary"`
@@ -38,7 +38,7 @@ type Sink interface {
 // ErrEmptyTranscript means the audio carried no speech worth storing.
 var ErrEmptyTranscript = errors.New("transcript is empty")
 
-// Result is what the API returns for one processed voice line.
+// Result is what the API returns for one processed voice memo.
 type Result struct {
 	Note    Note   `json:"note"`
 	Sink    string `json:"sink"`
@@ -79,7 +79,7 @@ func (s *Service) Process(ctx context.Context, filename string, audio io.Reader)
 	if err != nil {
 		return Result{}, fmt.Errorf("save to %s: %w", s.sink.Name(), err)
 	}
-	s.log.InfoContext(ctx, "voice line stored",
+	s.log.InfoContext(ctx, "voice memo stored",
 		"sink", s.sink.Name(), "sink_ref", ref, "action_items", len(note.ActionItems))
 
 	return Result{Note: note, Sink: s.sink.Name(), SinkRef: ref}, nil

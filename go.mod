@@ -1,4 +1,4 @@
-module github.com/ash-singh/voiceline-challenge
+module github.com/ash-singh/voice-to-note
 
 go 1.26
 

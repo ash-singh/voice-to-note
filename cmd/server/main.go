@@ -1,4 +1,4 @@
-// Command server exposes the voice line API: audio in, LLM-extracted note out,
+// Command server exposes the voice memo API: audio in, LLM-extracted note out,
 // note pushed to the configured sink.
 package main
 
@@ -14,12 +14,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/ash-singh/voiceline-challenge/internal/config"
-	"github.com/ash-singh/voiceline-challenge/internal/httpapi"
-	"github.com/ash-singh/voiceline-challenge/internal/llm"
-	"github.com/ash-singh/voiceline-challenge/internal/logging"
-	"github.com/ash-singh/voiceline-challenge/internal/sink"
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/config"
+	"github.com/ash-singh/voice-to-note/internal/httpapi"
+	"github.com/ash-singh/voice-to-note/internal/llm"
+	"github.com/ash-singh/voice-to-note/internal/logging"
+	"github.com/ash-singh/voice-to-note/internal/memo"
+	"github.com/ash-singh/voice-to-note/internal/sink"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func run() error {
 		return err
 	}
 
-	log := logging.New(cfg.LogLevel, os.Stdout).With("service", "voiceline")
+	log := logging.New(cfg.LogLevel, os.Stdout).With("service", "voice-to-note")
 	slog.SetDefault(log)
 
 	llmClient := llm.NewClient(llm.Options{
@@ -46,8 +46,8 @@ func run() error {
 		HTTPClient:      &http.Client{Timeout: cfg.ProcessTimeout},
 	})
 	noteSink := sink.New(cfg)
-	service := voiceline.NewService(llmClient, llmClient, noteSink, log)
-	handler := httpapi.NewVoicelineHandler(service, cfg.MaxAudioBytes, cfg.ProcessTimeout, log)
+	service := memo.NewService(llmClient, llmClient, noteSink, log)
+	handler := httpapi.NewNoteHandler(service, cfg.MaxAudioBytes, cfg.ProcessTimeout, log)
 
 	gin.SetMode(gin.ReleaseMode)
 	srv := &http.Server{

@@ -1,4 +1,4 @@
-package voiceline_test
+package memo_test
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 type fakeTranscriber struct {
@@ -25,12 +25,12 @@ func (f *fakeTranscriber) Transcribe(_ context.Context, filename string, audio i
 }
 
 type fakeAnalyzer struct {
-	note          voiceline.Note
+	note          memo.Note
 	err           error
 	gotTranscript string
 }
 
-func (f *fakeAnalyzer) Analyze(_ context.Context, transcript string) (voiceline.Note, error) {
+func (f *fakeAnalyzer) Analyze(_ context.Context, transcript string) (memo.Note, error) {
 	f.gotTranscript = transcript
 	return f.note, f.err
 }
@@ -38,10 +38,10 @@ func (f *fakeAnalyzer) Analyze(_ context.Context, transcript string) (voiceline.
 type fakeSink struct {
 	ref     string
 	err     error
-	gotNote voiceline.Note
+	gotNote memo.Note
 }
 
-func (f *fakeSink) Save(_ context.Context, note voiceline.Note) (string, error) {
+func (f *fakeSink) Save(_ context.Context, note memo.Note) (string, error) {
 	f.gotNote = note
 	return f.ref, f.err
 }
@@ -55,13 +55,13 @@ func discardLogger() *slog.Logger {
 func TestProcessStoresExtractedNote(t *testing.T) {
 	// Arrange
 	tr := &fakeTranscriber{text: "call Anna about the invoice"}
-	an := &fakeAnalyzer{note: voiceline.Note{
+	an := &fakeAnalyzer{note: memo.Note{
 		Title:       "Invoice follow-up",
 		Summary:     "Needs a call with Anna.",
 		ActionItems: []string{"Call Anna"},
 	}}
 	sk := &fakeSink{ref: "page-1"}
-	svc := voiceline.NewService(tr, an, sk, discardLogger())
+	svc := memo.NewService(tr, an, sk, discardLogger())
 
 	// Act
 	got, err := svc.Process(context.Background(), "memo.m4a", strings.NewReader("RIFF"))
@@ -110,7 +110,7 @@ func TestProcessErrors(t *testing.T) {
 			tr:      &fakeTranscriber{text: "   "},
 			an:      &fakeAnalyzer{},
 			sk:      &fakeSink{},
-			wantErr: voiceline.ErrEmptyTranscript,
+			wantErr: memo.ErrEmptyTranscript,
 		},
 		{
 			name:    "analyzer fails",
@@ -132,7 +132,7 @@ func TestProcessErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := voiceline.NewService(tt.tr, tt.an, tt.sk, discardLogger())
+			svc := memo.NewService(tt.tr, tt.an, tt.sk, discardLogger())
 
 			_, err := svc.Process(context.Background(), "memo.m4a", strings.NewReader("x"))
 
@@ -148,7 +148,7 @@ func TestProcessErrors(t *testing.T) {
 
 func TestProcessSkipsSinkOnEmptyTranscript(t *testing.T) {
 	sk := &fakeSink{}
-	svc := voiceline.NewService(&fakeTranscriber{text: ""}, &fakeAnalyzer{}, sk, discardLogger())
+	svc := memo.NewService(&fakeTranscriber{text: ""}, &fakeAnalyzer{}, sk, discardLogger())
 
 	if _, err := svc.Process(context.Background(), "memo.m4a", strings.NewReader("x")); err == nil {
 		t.Fatal("Process() error = nil, want ErrEmptyTranscript")

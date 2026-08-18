@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/memo"
 )
 
 // maxErrBody caps how much of an upstream error body we echo into our error.
@@ -40,7 +40,7 @@ func (w *Webhook) Name() string { return "webhook" }
 
 // Save posts the note and returns the id the target reported, falling back to
 // the target URL when the response carries no id.
-func (w *Webhook) Save(ctx context.Context, note voiceline.Note) (string, error) {
+func (w *Webhook) Save(ctx context.Context, note memo.Note) (string, error) {
 	body, err := json.Marshal(note)
 	if err != nil {
 		return "", err

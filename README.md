@@ -1,10 +1,10 @@
-# Voiceline
+# Voice-to-Note
 
 Go/Gin service that takes a voice memo, has an LLM turn it into a structured
 note, and submits that note to an external tool.
 
 ```
-POST /v1/voicelines (multipart audio)
+POST /v1/notes (multipart audio)
         │
         ├─ 1. speech-to-text   (OpenAI-compatible /audio/transcriptions)
         ├─ 2. note extraction  (OpenAI-compatible /chat/completions, JSON mode)
@@ -30,7 +30,7 @@ Fastest usable config: an OpenAI key plus a fresh URL from
 needed to see the note arrive.
 
 ```bash
-curl -F "audio=@memo.m4a" http://localhost:8080/v1/voicelines
+curl -F "audio=@memo.m4a" http://localhost:8080/v1/notes
 ```
 
 ```json
@@ -56,7 +56,7 @@ Record a test memo on macOS:
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/healthz` | liveness probe |
-| `POST` | `/v1/voicelines` | multipart form, file part **`audio`** |
+| `POST` | `/v1/notes` | multipart form, file part **`audio`** |
 
 Status codes: `201` created · `400` missing/invalid form · `413` audio over
 `MAX_AUDIO_BYTES` · `415` unsupported extension · `422` no speech detected ·
@@ -101,7 +101,7 @@ newline-delimited JSON, so point Axiom's collector (or Vector, or the platform's
 log driver) at the container's stdout and the fields land as-is.
 
 Log levels map to status: `5xx` → error, `4xx` → warn, otherwise info, so an
-Axiom alert on `level:error service:voiceline` is enough for basic monitoring.
+Axiom alert on `level:error service:voice-to-note` is enough for basic monitoring.
 
 ## Tests
 
@@ -121,7 +121,7 @@ Coverage: 100% of the domain package, ~92% of the HTTP layer, 77% overall
 
 ## Design notes / scope
 
-* **Layout** — `internal/voiceline` owns the flow and defines
+* **Layout** — `internal/memo` owns the flow and defines
   `Transcriber`/`Analyzer`/`Sink`; `llm`, `sink` and `httpapi` are adapters. The
   interfaces exist because they carry two real implementations each (a fake in
   tests, plus two sinks), not for speculative extensibility.

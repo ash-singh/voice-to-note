@@ -14,7 +14,7 @@ func respondError(c *gin.Context, status int, message string) {
 
 // NewRouter builds the Gin engine. gin.New (not gin.Default) so request logging
 // goes through slog instead of Gin's unstructured logger.
-func NewRouter(h *VoicelineHandler, log *slog.Logger) *gin.Engine {
+func NewRouter(h *NoteHandler, log *slog.Logger) *gin.Engine {
 	r := gin.New()
 	r.MaxMultipartMemory = 8 << 20 // 8 MiB in memory, larger uploads spill to disk
 	r.Use(RequestID(), RequestLogger(log), Recovery(log))
@@ -22,7 +22,7 @@ func NewRouter(h *VoicelineHandler, log *slog.Logger) *gin.Engine {
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	r.POST("/v1/voicelines", h.Create)
+	r.POST("/v1/notes", h.Create)
 
 	return r
 }

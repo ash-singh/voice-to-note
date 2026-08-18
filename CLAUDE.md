@@ -24,24 +24,24 @@ fails fast with a joined error listing every missing variable. See
 
 ## Architecture
 
-One synchronous pipeline behind `POST /v1/voicelines` (multipart field `audio`):
+One synchronous pipeline behind `POST /v1/notes` (multipart field `audio`):
 transcribe → extract a structured note via an LLM → submit that note to an
 external tool. `GET /healthz` is the probe.
 
-`internal/voiceline` is the core: it owns `Service.Process` and **defines** the
+`internal/memo` is the core: it owns `Service.Process` and **defines** the
 `Transcriber`, `Analyzer` and `Sink` interfaces it needs. Everything else is an
 adapter that satisfies them, so the dependency arrows point inward:
 
 - `internal/llm` — one `Client` implements both `Transcriber` (multipart POST to
   `/audio/transcriptions`, streamed through `io.Pipe`) and `Analyzer`
-  (`/chat/completions` in JSON mode, content unmarshalled into `voiceline.Note`).
+  (`/chat/completions` in JSON mode, content unmarshalled into `memo.Note`).
   `BaseURL` is injectable, which is what makes any OpenAI-compatible provider
   work and what lets tests point at an `httptest.Server`.
 - `internal/sink` — `Webhook` (JSON POST anywhere) and `Notion` (a page per memo
   under a *page* parent, so no database schema coupling). `sink.New(cfg)` picks
   one from config.
 - `internal/httpapi` — Gin layer. Depends on the narrow `Processor` interface,
-  not on `*voiceline.Service`.
+  not on `*memo.Service`.
 - `internal/config` — env → `Config`, validated in `Load`.
 
 When adding a step or a delivery target, add the interface method or
@@ -60,9 +60,9 @@ deliberately not unit tested.
   `...Context` methods (`InfoContext`, `ErrorContext`) and thread `ctx` through.
   The router uses `gin.New()`, never `gin.Default()` — Gin's own logger would
   duplicate the structured access log written by `httpapi.RequestLogger`.
-- **HTTP status mapping** lives in `httpapi.VoicelineHandler.Create`: 400
+- **HTTP status mapping** lives in `httpapi.NoteHandler.Create`: 400
   missing/invalid form, 413 over `MAX_AUDIO_BYTES`, 415 extension not in
-  `allowedAudioExt`, 422 `voiceline.ErrEmptyTranscript`, 502 any other pipeline
+  `allowedAudioExt`, 422 `memo.ErrEmptyTranscript`, 502 any other pipeline
   error. Errors use `{"error": "..."}`, success uses `{"data": ...}`.
 - Upstream failures wrap the cause (`fmt.Errorf("transcribe: %w", err)`) and
   error bodies from third parties are echoed only up to `maxErrBody` bytes.

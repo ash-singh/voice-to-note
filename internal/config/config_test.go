@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ash-singh/voiceline-challenge/internal/config"
+	"github.com/ash-singh/voice-to-note/internal/config"
 )
 
 // configEnv is every variable Load reads; tests clear them so the developer's

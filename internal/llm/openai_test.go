@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ash-singh/voiceline-challenge/internal/llm"
+	"github.com/ash-singh/voice-to-note/internal/llm"
 )
 
 func newClient(t *testing.T, h http.Handler) *llm.Client {

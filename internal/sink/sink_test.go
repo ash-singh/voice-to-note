@@ -9,12 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ash-singh/voiceline-challenge/internal/config"
-	"github.com/ash-singh/voiceline-challenge/internal/sink"
-	"github.com/ash-singh/voiceline-challenge/internal/voiceline"
+	"github.com/ash-singh/voice-to-note/internal/config"
+	"github.com/ash-singh/voice-to-note/internal/memo"
+	"github.com/ash-singh/voice-to-note/internal/sink"
 )
 
-var testNote = voiceline.Note{
+var testNote = memo.Note{
 	Title:       "Invoice",
 	Summary:     "Call Anna.",
 	ActionItems: []string{"Call Anna", "Send the invoice"},
@@ -23,7 +23,7 @@ var testNote = voiceline.Note{
 
 func TestWebhookSavePostsNoteAsJSON(t *testing.T) {
 	// Arrange
-	var gotBody voiceline.Note
+	var gotBody memo.Note
 	var gotContentType string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotContentType = r.Header.Get("Content-Type")
@@ -135,7 +135,7 @@ func TestNotionSaveChunksLongTranscript(t *testing.T) {
 	defer srv.Close()
 	s := sink.NewNotion(srv.URL, "t", "p", srv.Client())
 
-	long := voiceline.Note{Title: "Long", Summary: "s", Transcript: strings.Repeat("ä", 3000)}
+	long := memo.Note{Title: "Long", Summary: "s", Transcript: strings.Repeat("ä", 3000)}
 	if _, err := s.Save(context.Background(), long); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
