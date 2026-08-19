@@ -104,19 +104,3 @@ backoff, dead lettering and a backlog cap; it deliberately has no auth, no
 per-client rate limiting, no database and no Docker, and retries do not honour
 upstream `Retry-After`. README's "Design notes / scope" is the current list.
 Prefer keeping it that way over adding infrastructure.
-
-# Response Style
-
-Use ASD-STE100 Simplified Technical English.
-
-For all responses:
-- Be concise.
-- Use short sentences.
-- Use simple and precise words.
-- Avoid filler and repetition.
-- Avoid long introductions and conclusions.
-- State the result first.
-- Explain only what is necessary.
-- Prefer bullet points for multiple items.
-- Keep technical terms when they are standard in software engineering.
-- Do not simplify code, API names, framework names, or established technical terminology.
