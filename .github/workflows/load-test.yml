@@ -1,0 +1,71 @@
+name: Load test
+
+# Manual only: exercises the API/queue/worker path against a local mock LLM
+# and sink (tools/loadtest/mockapi), never a real provider. See
+# docs/load_test_summary.md for baseline results and methodology.
+on:
+  workflow_dispatch:
+    inputs:
+      queue_workers:
+        description: QUEUE_WORKERS for the server under test
+        default: "2"
+      requests:
+        description: total requests for the load generator
+        default: "500"
+      concurrency:
+        description: concurrent clients for the load generator
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build server and load-test tools
+        run: |
+          go build -o /tmp/vtn-server ./cmd/server
+          go build -o /tmp/mockapi ./tools/loadtest/mockapi
+          go build -o /tmp/loadgen ./tools/loadtest/gen
+
+      - name: Start mock LLM/sink
+        run: |
+          /tmp/mockapi -addr :19090 &
+          sleep 1
+          curl -sf -X POST http://127.0.0.1:19090/webhook -d '{}' >/dev/null
+
+      - name: Start server under test
+        env:
+          LLM_API_KEY: test-key
+          LLM_BASE_URL: http://127.0.0.1:19090/v1
+          SINK: webhook
+          WEBHOOK_URL: http://127.0.0.1:19090/webhook
+          ADDR: :18080
+          QUEUE_DIR: /tmp/loadtest-queue
+          QUEUE_WORKERS: ${{ github.event.inputs.queue_workers }}
+          QUEUE_MAX_DEPTH: "100"
+          LOG_LEVEL: warn
+        run: |
+          mkdir -p "$QUEUE_DIR"
+          /tmp/vtn-server &
+          sleep 1
+          curl -sf http://127.0.0.1:18080/healthz >/dev/null
+
+      - name: Run load generator
+        env:
+          REQUESTS: ${{ github.event.inputs.requests }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          QUEUE_WORKERS: ${{ github.event.inputs.queue_workers }}
+        run: |
+          /tmp/loadgen -addr http://127.0.0.1:18080 \
+            -n "$REQUESTS" \
+            -c "$CONCURRENCY" \
+            -label "ci-w${QUEUE_WORKERS}-c${CONCURRENCY}-n${REQUESTS}"
